@@ -17,12 +17,11 @@ ArthiX brings customer relationships, finance, team work, and day-to-day operati
 
 ## Product introduction
 
-Watch the two-minute ArthiX overview:
+The short silent preview below animates automatically in README viewers that support animated GIFs, including GitHub on mobile and desktop. Tap the link for the complete two-minute video with human-style voiceover.
 
-<video controls playsinline preload="metadata" poster="docs/media/ArthiX_Video_Poster.png" width="100%">
-  <source src="docs/media/ArthiX_Product_Introduction.mp4" type="video/mp4" />
-  <a href="docs/media/ArthiX_Product_Introduction.mp4">Play or download the ArthiX product introduction (MP4)</a>
-</video>
+![ArthiX product preview — automatically looping silent preview](docs/media/ArthiX_Autoplay_Preview.gif)
+
+[▶ Watch the full two-minute narrated ArthiX video (MP4)](docs/media/ArthiX_Product_Introduction.mp4)
 
 Prefer slides? Open the [10-page ArthiX product presentation](docs/media/ArthiX_Overview.pdf).
 
