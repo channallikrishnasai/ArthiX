@@ -1,0 +1,61 @@
+{
+  "name": "@veska/cli",
+  "version": "0.1.1",
+  "description": "ArthiX CLI — scaffold plugins, run local dev instances",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "ArthiX": "./dist/bin/veska.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsc -p tsconfig.build.json --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run --passWithNoTests",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@veska/sdk": "workspace:*",
+    "commander": "^12.1.0",
+    "ora": "^8.1.1",
+    "chalk": "^5.4.1",
+    "prompts": "^2.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/prompts": "^2.4.9",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "keywords": [
+    "ArthiX",
+    "cli",
+    "plugin",
+    "scaffold",
+    "erp",
+    "self-hosted"
+  ],
+  "homepage": "https://github.com/channallikrishnasai/ArthiX/tree/main/packages/cli#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/channallikrishnasai/ArthiX.git",
+    "directory": "packages/cli"
+  },
+  "bugs": {
+    "url": "https://github.com/channallikrishnasai/ArthiX/issues"
+  }
+}

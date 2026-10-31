@@ -1,0 +1,124 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: veska
+      POSTGRES_PASSWORD: veska
+      POSTGRES_DB: veska
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U veska']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    restart: unless-stopped
+    ports:
+      - '3001:3001'
+    environment:
+      DATABASE_URL: postgresql://veska:veska@postgres:5432/veska
+      # Non-superuser role for request-scoped queries, so RLS is actually enforced.
+      # Created by docker/initdb/01-app-role.sh on first start of the volume.
+      DATABASE_APP_URL: postgresql://veska_app:veska_app@postgres:5432/veska
+      REDIS_URL: redis://redis:6379
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      NODE_ENV: development
+      PORT: 3001
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      MAGIC_LINK_SECRET: ${MAGIC_LINK_SECRET:-insecure-default-magic-link-secret-change-me}
+      MAGIC_LINK_BASE_URL: http://localhost:3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./apps/api/src
+          target: /app/apps/api/src
+        - action: rebuild
+          path: apps/api/package.json
+
+  admin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: admin
+    restart: unless-stopped
+    ports:
+      - '3000:3000'
+    environment:
+      # Browser-side: reached from the host, so localhost.
+      NEXT_PUBLIC_API_URL: http://localhost:3001
+      # Server-side (route handlers and the /api/veska proxy): reached over the compose
+      # network, where localhost is this container, not the API.
+      API_URL: http://api:3001
+      NODE_ENV: development
+    depends_on:
+      - api
+    develop:
+      watch:
+        - action: sync
+          path: ./apps/admin/src
+          target: /app/apps/admin/src
+
+  marketing:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: marketing
+    restart: unless-stopped
+    ports:
+      - '3002:3002'
+    environment:
+      NODE_ENV: production
+    develop:
+      watch:
+        - action: sync
+          path: ./apps/marketing/src
+          target: /app/apps/marketing/src
+
+  marketplace:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: marketplace
+    restart: unless-stopped
+    ports:
+      - '3003:3003'
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:3001
+      NODE_ENV: production
+    develop:
+      watch:
+        - action: sync
+          path: ./apps/marketplace/src
+          target: /app/apps/marketplace/src
+
+volumes:
+  postgres_data:
+  redis_data:

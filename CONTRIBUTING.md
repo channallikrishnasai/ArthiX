@@ -1,68 +1,82 @@
-# Contributing
+# Contributing to Veska
 
-Jarvis is not accepting external code contributions or pull requests at this
-time.
+Thanks for considering a contribution. Here's everything you need to know.
 
-If you find a problem while using Jarvis, please report it through **Support**
-inside the app.
+## Before you start
 
-## Branches and releases
+- Check [GitHub Issues](https://github.com/channallikrishnasai/ArthiX/issues) to see if your idea or bug is already tracked.
+- For large changes (new modules, architectural changes), open a discussion first so we can align before you invest the time.
+- Small fixes (typos, minor bugs, test coverage) — just open a PR.
 
-Runtime branding and upgrade tests use checksum-pinned snapshots of Admin-owned
-inputs, stored encoded under `jarvis/ci/data`. CI validates and decodes them into
-temporary files outside the checkout; no repository variables or credentials are
-needed. Review snapshot changes with their Admin source documents and checksum
-pins. Do not generate migration fixtures from production constants.
+## Development setup
 
-For local validation, run `python -m jarvis.ci.inputs policy --output /tmp/jarvis-policy.json`
-then `python -m jarvis.ci.runtime_branding --policy /tmp/jarvis-policy.json`.
+```bash
+git clone https://github.com/channallikrishnasai/ArthiX.git
+cd veska
+pnpm install
+cp .env.example .env
+docker compose up -d postgres redis   # Postgres + Redis only; pnpm dev serves the apps
+pnpm db:migrate
+pnpm seed
+pnpm dev
+```
 
-| Branch | Role | What may merge into it |
-|---|---|---|
-| `develop` | default; all work lands here first | feature and fix PRs |
-| `version-16-hotfix`, `version-15-hotfix` | backports waiting for the next release | backport PRs (cherry-picks from `develop`), fixes found in production |
-| `version-16`, `version-15` | stable; what customers install and what Frappe Cloud tracks | **only** the release PR from the matching hotfix branch |
+## Code standards
 
-- A backport PR targets `version-N-hotfix`, never `version-N`. The `release-source` check
-  (`.github/workflows/release-guard.yml`) fails any other PR into a stable branch. It
-  blocks the merge only where the branch ruleset lists it as a required check; wire that
-  in repo settings, the workflow cannot do it by itself.
-- A fix found in production goes to the hotfix branch first, then is forward-ported to
-  `develop` in its own PR so it is not lost on the next backport.
-- A release is one PR, `version-N-hotfix` -> `version-N`, titled `chore: release vN.x.y`,
-  merged with a merge commit. Before opening it, bump `__version__` in `jarvis/__init__.py`
-  on the hotfix branch (feature backports bump minor, fix-only bumps patch). On merge the
-  `Release` workflow (`.github/workflows/release.yml`) tags the merge commit `vN.x.y` and
-  publishes a GitHub Release with notes generated from the previous tag on that line.
-  Check the Releases page afterwards; if the run failed, re-run it from the Actions tab.
-  It resumes whatever step was missing (tag, Release, or nothing).
-- Never push directly to any of these five branches; everything lands through a PR.
-  The `version-N` rulesets enforce this today, and the `version-N-hotfix` rulesets should
-  match them (PR required, no force-push, no deletion).
-- On a release PR the same check also fails unless `__version__` moved up and its major
-  matches the line, so a release cannot ship without the bump.
+- **TypeScript strict mode.** No `any` without a documented reason.
+- **No comments explaining what the code does.** Only comment the *why* when it's non-obvious.
+- **Tests required for `packages/core`.** Coverage must stay above 80%.
+- **Conventional Commits.** Format: `type(scope): description`. Types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`.
+- **Never bypass the permission system or audit log.** All writes go through the same APIs as plugins.
+- **Never let the AI take a money-moving action without explicit human confirmation.**
 
-## Upgrade regression tests
+## Pull request process
 
-Legacy upgrade tests require the independently maintained Admin fixture. Set
-`JARVIS_LEGACY_MIGRATION_FIXTURES_FILE` to an absolute path to
-`integration_fixtures/legacy_migrations.json` in the Admin checkout before running
-these tests on a dedicated test site. For the pinned local snapshot, run
-`python -m jarvis.ci.inputs fixture --output /tmp/jarvis-migration-fixture.json`
-and set the environment variable to that file. CI uses this same snapshot. Missing inputs fail the tests; keep decoded copies
-outside this repository. See Admin's
-`jarvis_admin_v2/docs/legacy-migration-test-fixtures.md` for activation and commands.
+1. Fork the repo and create a branch: `git checkout -b feat/my-feature`
+2. Make your changes and add tests.
+3. Run `pnpm typecheck && pnpm lint && pnpm test` and fix any failures.
+4. Push and open a PR against `main`.
+5. Fill in the PR template.
 
+PRs are reviewed within 3 business days. We may ask for changes; we won't close without explanation.
 
-The pinned upgrade fixture retains the historical settings mappings so direct
-upgrades do not require an intermediate release. The settings patch runs before
-model sync and preserves completed migration records and existing destination
-values, including encrypted credentials. The runtime profile is refreshed after
-migration when needed; an offline Admin does not fail migration. Readiness retries
-profile initialization and never advertises Ready without a usable local profile.
-Older Admin versions must be upgraded to supply that profile; existing valid
-receipts continue to work during an Admin outage or rollback.
+## Contributing a plugin
 
-CI uses the dedicated `jarvis-ci.test` site so runtime-profile database tests run
-instead of skipping their `.test` safety check. Saved HTML sanitization has its
-own bundled historical contract and remains available during connection resets.
+Plugins are the highest-leverage way to help. They extend what Veska can do without
+touching core, and a good one can go from idea to merged in an afternoon. If you want
+Veska to sync with a tool you use (a CRM, a payment provider, an e-commerce platform, a
+help desk), build a plugin for it.
+
+A plugin is a small folder under `plugins/official/<name>/` with three files:
+
+- `manifest.json` — id, version, the entities it touches, `capabilitiesRequired`, and a
+  `networkWhitelist` of hosts it may call.
+- `package.json` — depends on `@veska/sdk`; add a `test` script.
+- `src/index.ts` — exported handler functions, each `(input, ctx: VeskaPluginContext)`.
+
+Handlers never touch the database. All data access goes through the injected `ctx`
+(`ctx.entities.find/create/update`, `ctx.audit.log`, and more), which enforces the same
+permissions and audit logging as the rest of the platform.
+
+To build one:
+
+1. Scaffold with `npx @veska/cli create-plugin my-plugin`, or copy the closest official
+   plugin as a template:
+   - Inbound sync (an external webhook creates Veska records): [Stripe](plugins/official/stripe), [Shopify](plugins/official/shopify).
+   - Outbound sync (a Veska event pushes to an external API): [QuickBooks](plugins/official/quickbooks), [Xero](plugins/official/xero).
+2. Keep every external host you call listed in the manifest `networkWhitelist`.
+3. Add unit tests. Mock `ctx` (and `fetch` for outbound plugins) and assert on the exact
+   mutations and API calls your handlers make. The official plugins' `src/__tests__/` show
+   the pattern.
+4. Run `pnpm --filter @veska-official/plugin-<name> test` and open a PR.
+
+For a brand-new integration, open a [discussion](https://github.com/channallikrishnasai/ArthiX/discussions)
+first so we can flag anything (auth model, rate limits) before you invest the time.
+
+## Architecture Decision Records
+
+Major decisions live in `docs/adr/`. If your PR introduces a significant technical choice, add an ADR alongside the code.
+
+## Questions?
+
+Open a [GitHub Discussion](https://github.com/channallikrishnasai/ArthiX/discussions). We read everything.

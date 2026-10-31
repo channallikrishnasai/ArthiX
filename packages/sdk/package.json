@@ -1,0 +1,53 @@
+{
+  "name": "@veska/sdk",
+  "version": "0.1.0",
+  "description": "ArthiX Plugin SDK — build plugins for the ArthiX marketplace",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsc -p tsconfig.build.json --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run --passWithNoTests",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "keywords": [
+    "ArthiX",
+    "plugin",
+    "sdk",
+    "erp",
+    "crm",
+    "self-hosted"
+  ],
+  "homepage": "https://github.com/channallikrishnasai/ArthiX/tree/main/packages/sdk#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/channallikrishnasai/ArthiX.git",
+    "directory": "packages/sdk"
+  },
+  "bugs": {
+    "url": "https://github.com/channallikrishnasai/ArthiX/issues"
+  }
+}

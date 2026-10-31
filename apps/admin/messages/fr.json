@@ -1,0 +1,204 @@
+{
+  "nav": {
+    "dashboard": "Tableau de bord",
+    "finance": "Finance",
+    "invoices": "Factures",
+    "expenses": "D\u00e9penses",
+    "hr": "RH et personnes",
+    "employees": "Employ\u00e9s",
+    "leave": "Demandes de cong\u00e9",
+    "payroll": "Paie",
+    "crm": "CRM",
+    "contacts": "Contacts",
+    "deals": "Opportunit\u00e9s",
+    "projects": "Projets",
+    "support": "Support",
+    "tickets": "Tickets",
+    "knowledgeBase": "Base de connaissances",
+    "inventory": "Inventaire",
+    "settings": "Param\u00e8tres",
+    "auditLog": "Journal d'audit",
+    "webhooks": "Webhooks",
+    "developer": "D\u00e9veloppeur",
+    "jobQueues": "Files de travaux"
+  },
+  "common": {
+    "save": "Enregistrer",
+    "cancel": "Annuler",
+    "delete": "Supprimer",
+    "edit": "Modifier",
+    "view": "Voir",
+    "create": "Cr\u00e9er",
+    "search": "Rechercher",
+    "filter": "Filtrer",
+    "export": "Exporter CSV",
+    "import": "Importer CSV",
+    "loading": "Chargement...",
+    "noResults": "Aucun r\u00e9sultat trouv\u00e9",
+    "actions": "Actions",
+    "status": "Statut",
+    "date": "Date",
+    "amount": "Montant",
+    "name": "Nom",
+    "email": "E-mail",
+    "phone": "T\u00e9l\u00e9phone",
+    "yes": "Oui",
+    "no": "Non",
+    "back": "Retour",
+    "next": "Suivant",
+    "previous": "Pr\u00e9c\u00e9dent",
+    "close": "Fermer",
+    "confirm": "Confirmer",
+    "refresh": "Actualiser",
+    "submit": "Soumettre",
+    "required": "Obligatoire"
+  },
+  "auth": {
+    "login": "Se connecter \u00e0 ArthiX",
+    "email": "Adresse e-mail",
+    "password": "Mot de passe",
+    "forgotPassword": "Mot de passe oubli\u00e9 ?",
+    "signIn": "Se connecter",
+    "signingIn": "Connexion en cours...",
+    "forgotPasswordTitle": "R\u00e9initialiser votre mot de passe",
+    "forgotPasswordDesc": "Entrez votre e-mail et nous vous enverrons un lien de r\u00e9initialisation",
+    "sendResetLink": "Envoyer le lien de r\u00e9initialisation",
+    "checkEmail": "V\u00e9rifiez votre e-mail",
+    "resetPassword": "D\u00e9finir un nouveau mot de passe",
+    "newPassword": "Nouveau mot de passe",
+    "confirmPassword": "Confirmer le mot de passe",
+    "updatePassword": "Mettre \u00e0 jour le mot de passe"
+  },
+  "dashboard": {
+    "title": "Tableau de bord",
+    "welcome": "Bon retour",
+    "totalRevenue": "Revenus totaux",
+    "openInvoices": "Factures ouvertes",
+    "pendingExpenses": "D\u00e9penses en attente",
+    "activeEmployees": "Employ\u00e9s actifs"
+  },
+  "invoices": {
+    "title": "Factures",
+    "newInvoice": "Nouvelle facture",
+    "runPayroll": "Lancer la paie",
+    "invoiceNumber": "Facture N\u00b0",
+    "customer": "Client",
+    "dueDate": "Date d'\u00e9ch\u00e9ance",
+    "issuedDate": "Date d'\u00e9mission",
+    "sendInvoice": "Envoyer la facture",
+    "markPaid": "Marquer comme pay\u00e9",
+    "voidInvoice": "Annuler la facture",
+    "status": {
+      "draft": "Brouillon",
+      "sent": "Envoy\u00e9e",
+      "paid": "Pay\u00e9e",
+      "overdue": "En retard",
+      "void": "Annul\u00e9e",
+      "pending_approval": "En attente d'approbation"
+    }
+  },
+  "expenses": {
+    "title": "D\u00e9penses",
+    "newExpense": "Nouvelle d\u00e9pense",
+    "category": "Cat\u00e9gorie",
+    "submittedBy": "Soumis par",
+    "approveAll": "Tout approuver",
+    "rejectAll": "Tout rejeter",
+    "status": {
+      "draft": "Brouillon",
+      "submitted": "Soumis",
+      "approved": "Approuv\u00e9",
+      "rejected": "Rejet\u00e9"
+    }
+  },
+  "employees": {
+    "title": "Employ\u00e9s",
+    "newEmployee": "Nouvel employ\u00e9",
+    "department": "D\u00e9partement",
+    "role": "Poste",
+    "startDate": "Date de d\u00e9but",
+    "salary": "Salaire"
+  },
+  "settings": {
+    "title": "Param\u00e8tres",
+    "general": "G\u00e9n\u00e9ral",
+    "security": "S\u00e9curit\u00e9",
+    "notifications": "Notifications",
+    "theme": "Th\u00e8me",
+    "language": "Langue",
+    "light": "Clair",
+    "dark": "Sombre",
+    "system": "Syst\u00e8me",
+    "save": "Enregistrer les modifications",
+    "saved": "Modifications enregistr\u00e9es"
+  },
+  "errors": {
+    "notFound": "Page introuvable",
+    "goHome": "Aller au tableau de bord",
+    "serverError": "Une erreur est survenue",
+    "tryAgain": "R\u00e9essayer"
+  },
+  "crm": {
+    "title": "CRM Dashboard",
+    "leads": "Leads",
+    "contacts": "Contacts",
+    "deals": "Deals",
+    "pipeline": "Pipeline"
+  },
+  "hr": {
+    "title": "HR & People",
+    "employees": "Employees",
+    "leaveRequests": "Leave Requests",
+    "department": "Departments"
+  },
+  "support": {
+    "title": "Support",
+    "tickets": "Tickets",
+    "newTicket": "New Ticket",
+    "open": "Open",
+    "inProgress": "In Progress",
+    "resolved": "Resolved",
+    "closed": "Closed"
+  },
+  "approvals": {
+    "title": "Approvals",
+    "pending": "Pending",
+    "approved": "Approved",
+    "rejected": "Rejected",
+    "approve": "Approve",
+    "reject": "Reject"
+  },
+  "projects": {
+    "title": "Projects",
+    "newProject": "New Project",
+    "tasks": "Tasks",
+    "members": "Members",
+    "status": "Status"
+  },
+  "payroll": {
+    "title": "Payroll",
+    "runPayroll": "Run Payroll",
+    "period": "Pay Period",
+    "employees": "Employees",
+    "totalGross": "Total Gross"
+  },
+  "onboarding": {
+    "title": "Set up your workspace",
+    "step": "Step",
+    "of": "of",
+    "next": "Next",
+    "back": "Back",
+    "complete": "Complete setup",
+    "step1": "Your Business",
+    "step2": "Choose Features",
+    "step3": "Invite Team",
+    "step4": "Connect AI",
+    "step5": "You're Ready!"
+  },
+  "portal": {
+    "title": "Customer Portal",
+    "invite": "Invite Customer",
+    "active": "Active",
+    "expired": "Expired"
+  }
+}

@@ -1,15 +1,24 @@
-## Summary
+## What does this PR do?
 
-<!-- What does this change do, and why? -->
+<!-- One or two sentences. -->
 
-## Pre-merge checklist
+## Why?
 
-> ℹ️ A red check only blocks the merge where the branch ruleset lists it as required.
-> Honoring this checklist is what keeps broken changes out of UAT. See
-> [`CONTRIBUTING.md`](../CONTRIBUTING.md).
+<!-- The motivation — link to an issue if there is one. -->
 
-- [ ] **CI is green** — the `tests` check on this PR passes (never merge on ❌)
-- [ ] Branch is **up to date with its base** (`develop`, or `version-N-hotfix` for a backport)
-- [ ] New/changed behavior has tests (the coverage gate still passes)
-- [ ] I self-reviewed the diff
-- [ ] If the base is `version-N`: this is the release PR from `version-N-hotfix`, `__version__` is bumped, and `release-source` is green
+## Changes
+
+<!-- Bullet list of what changed. -->
+
+## Testing
+
+- [ ] I ran `pnpm typecheck && pnpm lint && pnpm test` and all checks pass
+- [ ] I added or updated tests for any new behavior in `packages/core`
+- [ ] I added an ADR in `docs/adr/` if this introduces a significant technical decision
+
+## Checklist
+
+- [ ] Commits follow Conventional Commits (`feat:`, `fix:`, `docs:`, etc.)
+- [ ] No `any` types introduced without a comment explaining why
+- [ ] No changes bypass the permission system or audit log
+- [ ] No money-moving actions without explicit human confirmation
