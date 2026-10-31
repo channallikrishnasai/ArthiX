@@ -648,10 +648,12 @@
 						<section v-else-if="state.step === 'details'" class="ob-screen">
 							<div class="ob-body">
 								<div class="ob-head">
-									<h1>Your details</h1>
-									<p>
-										We'll set {{ brand.agentName }} up for this workspace and
-										send receipts here.
+									<h1>{{ localPaymentDemo ? "Demo details" : "Your details" }}</h1>
+									<p v-if="localPaymentDemo">
+										These fields are for display only. The local demo will not submit or save them.
+									</p>
+									<p v-else>
+										We'll set {{ brand.agentName }} up for this workspace and send receipts here.
 									</p>
 								</div>
 								<div
@@ -1207,7 +1209,7 @@
 								 takes plain text (no slot, no markup), so the link-bearing
 								 sentence is a sibling <label for=...> instead - clicking the
 								 embedded <a> navigates without also toggling the box. -->
-							<div class="mb-6">
+							<div v-if="!localPaymentDemo" class="mb-6">
 								<div
 									class="mx-auto mt-5 flex max-w-[620px] items-start justify-center gap-2"
 								>
@@ -1271,7 +1273,7 @@
 									variant="solid"
 									label="Continue"
 									:loading="state.detailsSubmitting"
-									:disabled="!state.termsAccepted"
+									:disabled="!state.termsAccepted && !localPaymentDemo"
 									@click="onDetailsSubmit"
 								/>
 							</div>
@@ -1281,11 +1283,28 @@
 							 Sub-screens are driven by the machine state (pay.value), never by
 							 an HTTP status or an error message. ===== -->
 						<section v-else-if="state.step === 'pay'" class="ob-screen">
+							<div
+								v-if="localPaymentDemo && state.demoPaymentSuccess"
+								class="ob-body"
+								role="status"
+							>
+								<div class="ob-head">
+									<h1>Free trial started · demo</h1>
+									<p>Local checkout simulation completed using {{ providerLabel(state.demoPaymentSuccess) }}.</p>
+									<p class="mt-2 text-p-sm text-ink-gray-5">
+										This is a local-only preview. No card or bank details were collected, no payment or mandate was created, and no transaction appears in a Razorpay or Paytm dashboard.
+									</p>
+								</div>
+								<div class="mt-6 flex justify-center gap-3">
+									<Button variant="subtle" label="Run demo again" @click="state.demoPaymentSuccess = ''" />
+									<Button variant="solid" label="Open workspace" @click="router.push({ name: 'Chat' })" />
+								</div>
+							</div>
 							<!-- Paid: the payment step is over. Receipt + workspace-setup
 								 projection, rendered separately (plan 02 §Paid/provisioning).
 								 Provisioning belongs to the readiness gate, so this shows status
 								 only and never a payment action. -->
-							<template v-if="showPaidFlash || showProvisioning">
+							<template v-else-if="showPaidFlash || showProvisioning">
 								<div class="ob-body">
 									<div class="ob-head">
 										<h1>
@@ -1891,11 +1910,13 @@
 										<h1>Review &amp; pay</h1>
 										<p>
 											{{
-												privateComplete
-													? "Confirm the details below. We'll email you a confirmation link before anything is charged."
-													: isTrialPlan
-													? "Confirm the details below. You'll authorize auto-pay securely. Nothing is charged until your trial ends."
-													: "Confirm the details below. You'll complete payment securely."
+												localPaymentDemo
+													? "Local demo only: this will show a simulated success. It will not contact a provider or authorize auto-pay."
+													: privateComplete
+														? "Confirm the details below. We'll email you a confirmation link before anything is charged."
+														: isTrialPlan
+															? "Confirm the details below. You'll authorize auto-pay securely. Nothing is charged until your trial ends."
+															: "Confirm the details below. You'll complete payment securely."
 											}}
 										</p>
 									</div>
@@ -2077,8 +2098,12 @@
 											"
 											:aria-label="
 												isSingleProvider
-													? 'Payment method: Razorpay'
-													: 'Razorpay'
+													? localPaymentDemo
+														? 'Payment method: Razorpay local demo'
+														: 'Payment method: Razorpay'
+													: localPaymentDemo
+														? 'Razorpay local demo'
+														: 'Razorpay'
 											"
 											:disabled="isSingleProvider"
 											@click="chooseProvider('razorpay')"
@@ -2134,7 +2159,22 @@
 												class="block h-5.5 w-auto"
 											/>
 										</button>
+										<button
+											v-if="providerAvailable('paytm')"
+											type="button"
+											class="ob-provseg-opt flex min-h-11 flex-1 items-center justify-center rounded-lg px-2.5 py-2 transition-[background,box-shadow,opacity] focus-visible:ring focus-visible:ring-outline-gray-3"
+											:class="state.paymentProvider === 'paytm' ? 'bg-surface-white opacity-100 shadow-sm' : 'cursor-pointer opacity-60 hover:opacity-85'"
+											role="radio"
+											:aria-checked="state.paymentProvider === 'paytm'"
+											aria-label="Paytm demo"
+											@click="chooseProvider('paytm')"
+										>
+											<span class="text-base font-semibold tracking-tight text-blue-700">Paytm</span>
+										</button>
 									</div>
+									<p v-if="localPaymentDemo" class="mx-auto mt-2 max-w-[560px] text-center text-xs text-ink-gray-5" role="note">
+										Local demo providers only. Choosing either option never contacts a payment gateway.
+									</p>
 									<!-- Reconnect offer, gated ONLY on the backend's can_reconnect
 										 probe (C02-5): no prose matching. Shown when the control
 										 plane says this (email, company) has a paid account a
@@ -2877,12 +2917,18 @@ import { isExpectedCompanyDefaultsMiss } from "@/onboarding/companyDefaultsMiss"
 const router = useRouter();
 const { effectiveDark: dark, paletteVars } = useJarvisTheme();
 
+// A local-only checkout walkthrough for demos. It is unavailable in production
+// builds and must be explicitly enabled with ?paymentDemo=1. It never invokes
+// the billing control plane or a payment gateway.
+const localPaymentDemo =
+	import.meta.env.DEV && new URLSearchParams(window.location.search).get("paymentDemo") === "1";
+
 // Server-authoritative: onboarding is blocked when the bench is on a
 // local/non-public host (magic links + agent callbacks can't reach it).
 // jarvis_public_host_ok is purely host-based (the site's public host_name) -
 // there is no separate dev-bypass flag; a dev/e2e bench opts in by giving
 // itself a public-looking host_name, same as production.
-const hostOk = window.jarvis_public_host_ok !== false;
+const hostOk = window.jarvis_public_host_ok !== false || localPaymentDemo;
 
 // Private-network setup finished ("private") or not (""). jarvis_public_host_ok keeps its
 // own meaning (a public host is configured); the two together say which onboarding this
@@ -3027,6 +3073,7 @@ const state = reactive({
 	reconnectDirect: false,
 	reconnectEmail: "",
 	paymentProvider: "", // gateway chosen on Review & Pay: "razorpay" | "cashfree"
+	demoPaymentSuccess: "",
 	// Required Details-step checkbox (T&C + lead-capture contract; moved off
 	// Review & Pay 2026-08-16 so consent is captured before the Plan-step lead
 	// capture fires). NOT localStorage-persisted - a legal acceptance is
@@ -3292,6 +3339,11 @@ let reconnectIssued = null;
 let eligibilityTimer = null;
 const eligibilityCache = new Map();
 async function refreshReconnectEligibility() {
+	if (localPaymentDemo) {
+		state.reconnectEligible = false;
+		state.reconnectNeedsCompany = false;
+		return;
+	}
 	if (!reconnectInputsReady.value) {
 		state.reconnectEligible = false;
 		state.reconnectNeedsCompany = false;
@@ -3338,6 +3390,7 @@ watch(
 	() => state.step,
 	(step) => {
 		if (step !== "plan") return;
+		if (localPaymentDemo) return; // demo mode never sends lead or identity data to the backend
 		if (!(state.email || "").trim() || !(state.company || "").trim()) return;
 		try {
 			captureOnboardingLead({
@@ -3409,7 +3462,16 @@ const KNOWN_PROVIDERS = ["razorpay", "cashfree"];
 // The customer-facing gateway name, or "" for anything not in the known set - so
 // the "Secured by …" line fails CLOSED (renders nothing) rather than defaulting to
 // "Razorpay" for a provider that is not Razorpay (D10).
-const providerLabel = (p) => (p === "razorpay" ? "Razorpay" : p === "cashfree" ? "Cashfree" : "");
+const providerLabel = (p) =>
+	p === "razorpay"
+		? localPaymentDemo
+			? "Razorpay local demo"
+			: "Razorpay"
+		: p === "paytm"
+			? "Paytm demo"
+			: p === "cashfree"
+				? "Cashfree"
+				: "";
 const securedProviderLabel = computed(() => providerLabel(state.paymentProvider));
 
 const providerChoices = computed(() => state.availableProviders || []);
@@ -3455,6 +3517,15 @@ function chooseProvider(p) {
 async function loadPaymentProviders() {
 	state.providersLoading = true;
 	state.providersError = false;
+	if (localPaymentDemo) {
+		state.paymentUiV2 = true;
+		state.availableProviders = ["razorpay", "paytm"];
+		if (!state.availableProviders.includes(state.paymentProvider)) {
+			state.paymentProvider = "razorpay";
+		}
+		state.providersLoading = false;
+		return;
+	}
 	try {
 		const r = (await listPaymentProviders()) || {};
 		// plan-09 07-c: the rollout flag. Absent on an older backend → default ON.
@@ -3519,7 +3590,7 @@ const payDisabled = computed(
 	() =>
 		payBusyView.value ||
 		!payProviderReady.value ||
-		!state.termsAccepted ||
+		(!state.termsAccepted && !localPaymentDemo) ||
 		!onboardingHostOk.value
 );
 // #669: how long the checkout link is good for. Reads the machine's own
@@ -3983,6 +4054,7 @@ function scheduleCompanyDefaults() {
 	companyDefaultsTimer = setTimeout(fetchCompanyDefaults, 300);
 }
 async function fetchCompanyDefaults() {
+	if (localPaymentDemo) return; // keep demo checkout entirely local
 	const company = (state.company || "").trim();
 	// beginCompanyFetch clears prior-Company erp_default values (and mints the
 	// generation) whether or not a network call follows, so a switch to a custom
@@ -4020,8 +4092,8 @@ async function onDetailsSubmit() {
 	// reconnect branch too (item 5), which it must not. A customer with both a
 	// bad GSTIN and an unticked box sees the GSTIN error first and the terms
 	// error only on a second submit; accepted as the cost of that exemption.
-	if (billingDetailsInvalid()) return;
-	billing.persist();
+	if (!localPaymentDemo && billingDetailsInvalid()) return;
+	if (!localPaymentDemo) billing.persist();
 	// Editing billing after Review & Pay: return straight to Pay, and — once an
 	// intent exists — save the edit through the authenticated update_billing
 	// facade (NEVER a fresh guest signup, which would create/replace the intent).
@@ -4039,17 +4111,19 @@ async function onDetailsSubmit() {
 	// Forced-reconnect gate: an eligible existing (email, company) the customer ASSERTED
 	// may only reconnect. Fresh resolve here (cancelling the debounce) closes the
 	// type-then-Continue race; fails closed (guest signup() 409 still blocks a duplicate).
-	state.detailsSubmitting = true;
-	try {
-		clearTimeout(eligibilityTimer);
-		await refreshReconnectEligibility();
-		const id = reconnectIdentity.value;
-		if (state.reconnectEligible && id.email && id.company) {
-			await startReconnect();
-			return;
+	if (!localPaymentDemo) {
+		state.detailsSubmitting = true;
+		try {
+			clearTimeout(eligibilityTimer);
+			await refreshReconnectEligibility();
+			const id = reconnectIdentity.value;
+			if (state.reconnectEligible && id.email && id.company) {
+				await startReconnect();
+				return;
+			}
+		} finally {
+			state.detailsSubmitting = false;
 		}
-	} finally {
-		state.detailsSubmitting = false;
 	}
 	// Required T&C acceptance: checked here, AFTER the reconnect branch above
 	// (which already returned if it applied), so this gate never blocks a
@@ -4060,8 +4134,10 @@ async function onDetailsSubmit() {
 	// is already satisfied by the time we get here; kept as a defensive
 	// invariant against any submit that reaches this function without going
 	// through the disabled button.
-	detailsFieldErrors.terms = termsError(state.termsAccepted);
-	if (detailsFieldErrors.terms) return;
+	if (!localPaymentDemo) {
+		detailsFieldErrors.terms = termsError(state.termsAccepted);
+		if (detailsFieldErrors.terms) return;
+	}
 	// The customer just edited the details behind a FAILED attempt. Without this,
 	// walking forward from here landed them straight back on the old failure card
 	// with no new request made at all: the machine was still parked on the failed
@@ -5212,6 +5288,13 @@ async function onPayClick() {
 	// plan-09 07-c: the CTA is hidden behind the maintenance hold when the flag is
 	// off; guard the handler too so a stray/programmatic click cannot start a signup.
 	if (!state.paymentUiV2) return;
+	if (localPaymentDemo) {
+		// Deliberately do not enter the payment state machine: only the control plane
+		// may attest a real checkout. This result exists solely in local UI memory.
+		if (!state.paymentProvider || !["razorpay", "paytm"].includes(state.paymentProvider)) return;
+		state.demoPaymentSuccess = state.paymentProvider;
+		return;
+	}
 	// Plan 01: the normalized billing snapshot rides this first signup call so it
 	// persists server-side while the customer is still a guest. Omitted (undefined,
 	// never an empty object) when nothing was entered, so a blank Details step sends

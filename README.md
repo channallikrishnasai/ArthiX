@@ -142,6 +142,16 @@ On a private bench group:
 After installation, sign in as a System Manager, open `/jarvis/onboarding`, and
 follow the setup shown on screen.
 
+### Local payment walkthrough
+
+For a UI presentation, start the frontend in development mode and open
+`/jarvis/onboarding?paymentDemo=1`. Choose a plan, then select **Razorpay local demo**
+or **Paytm demo** and click **Start free trial**. The page shows a simulated success
+without sending identity or billing data, creating a subscription, authorizing a
+mandate, or contacting a payment provider. The mode is disabled in production builds.
+It does not create a Razorpay dashboard event; real Razorpay Test Mode needs test
+credentials on the billing control plane and a publicly reachable onboarding host.
+
 ### Updating PDF chart support
 
 Deploy the backend and its Python requirements (including Matplotlib) before the
