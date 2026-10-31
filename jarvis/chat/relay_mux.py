@@ -1,0 +1,1648 @@
+"""WP-1b — the one-reader WebSocket multiplexer (Relay Pump transport core).
+
+This module is the I/O adapter the pump reactor (D6) drives. It owns exactly
+ONE ``AgentSession`` (one WS per ``relay_target_id``) and is the SOLE caller
+of that socket's ``_recv`` — the single-reader constraint the pool warns about
+(``agent_session_pool.py:21-38``: two readers "would steal frames between
+turns") is not relaxed, it is INVERTED: one reader serves every turn on the
+container by DEMUXing frames instead of discarding non-matching ones.
+
+Binding contract (read in order):
+  * ../../../jarvis-chat-concurrency-design/implementation/wp-d/D5-mux-protocol.md
+    (AMENDED) — the reader-loop state diagram, pending-RPC map, run map with
+    fresh-send pre-registration (OAR-15), serialized send, bounded cancellable
+    futures + fail-all-on-Closing (OAR-10), integrity-class quarantine (delta
+    faults drop+count+continue, precious faults quarantine ONE lane, OAR-7),
+    per-shard poison-rate circuit breaker, stray-frame counter (Amendment I).
+  * implementation/spikes/S2-gateway-semantics.md — ack at accept
+    {runId,status}; broadcast agent/chat frames keyed by runId.
+  * jarvis/chat/agent_client.py — the frame classifiers this module adapts
+    around (``_is_response_frame``, ``_build_request_frame``, ``parse_event``,
+    ``_chat_final_text``/``_chat_final_failed``, the ``ack-timeout`` sentinel,
+    the serialized-send ``_lock`` idiom).
+
+HARD INVARIANTS (this component is TRANSPORT-PURE):
+  * NO ``frappe.db`` writes, NO ``turn_state`` calls inside this file — the mux
+    routes frames and invokes PUMP-PROVIDED callbacks; every DB CAS lives in
+    those callbacks (pump side). This is what keeps the mux unit-testable
+    against the fake gateway alone, and it is why a mux that keeps reading
+    after lease loss is still harmless: its callbacks' epoch+version CAS writes
+    (pump side) affect 0 rows (D5 non-goal "the mux is not the fence").
+  * The reader NEVER blocks on a lane (it only enqueues into a bounded per-lane
+    queue with an explicit overflow policy), NEVER invokes a lane callback, and
+    NEVER sends. Lane application is caller-driven via ``dispatch`` so it runs
+    on the pump's thread (which owns the DB connection).
+  * The reader makes NO ``egress_rules`` / ``generated_media`` / ``frappe.cache``
+    call either (a site DB read, same constraint as the write ban above): it
+    queues RAW text and lets ``dispatch()`` / ``_apply`` / ``_finalize_terminal``
+    - which run on the pump thread - redact and step-strip it before a lane
+    callback ever sees it (the #1449 regression was exactly this rule broken:
+    a reader-thread ``egress_rules`` call needs a site the reader does not
+    have).
+  * Every socket call goes through the session's IO gate (``socket_io``): one
+    operation at a time, so the reader loop and any RPC issuance never interleave
+    partial frames or TLS calls. Writes still take the session's one ``_lock``
+    first, and the wait for both is one bounded budget.
+  * A write that started and failed, or hit a socket error before its first byte,
+    POISONS the transport at once (``is_closed``): no later write starts, and the
+    reader's ``Closing`` fails every other pending RPC with the ambiguous
+    ``ack-timeout`` sentinel, never a definite error. A write refused as closed,
+    busy or past its deadline leaves the transport as it was.
+  * No second reader ever touches ``_recv`` (R-15): one thread owns the socket
+    read; RPC futures are resolved on that SAME reader loop.
+  * Only THREE causes end a hop (D5 §2/§5): socket failure, lease loss, or
+    site-DB failure. THIS module only observes the socket cause directly (the
+    reader's ``_recv`` raises) → ``Closing``. Lease loss and site-DB failure
+    are pump-side signals; the pump stops driving / ``stop()``s the mux.
+
+Threading model (works under both the gevent realtime executor and RQ threads —
+the waits use ``threading`` primitives the realtime process monkey-patches into
+cooperative waits, exactly as ``agent_session_pool`` does):
+  * READER thread (mux-owned, no DB): the sole ``_recv`` caller. Classifies each
+    frame and either resolves a pending-RPC future, routes an event to its lane
+    queue, or increments the stray counter. Never blocks, never calls a lane
+    callback.
+  * PUMP thread (the caller, has the DB): issues RPCs (``issue_rpc`` /
+    ``send_chat`` / ``abort`` / ``set_session_model`` → a bounded cancellable
+    future it awaits) and drains lane queues by calling ``dispatch``, which
+    invokes the lane callbacks with integrity-class fault handling.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass
+
+from jarvis.chat import egress_rules
+from jarvis.chat.agent_client import (
+	IO_GATE_WAIT_S,
+	IO_WRITE_TIMEOUT_S,
+	MEDIA_GEN_TOOL_NAMES,
+	AgentSession,
+	SendNotStarted,
+	SendUncertain,
+	_build_request_frame,
+	_chat_final_failed,
+	_chat_final_media_urls,
+	_chat_final_text,
+	_is_yield_aborted_final,
+	failed_final_error,
+)
+from jarvis.chat.events import parse_event
+from jarvis.chat.generated_media import detect_media_paths, has_embedded_media_path, has_media_marker
+from jarvis.chat.steps import (
+	display_line,
+	is_preamble_step,
+	is_step,
+	join_segments,
+	remove_steps,
+	strip_preambles,
+	strip_steps,
+)
+from jarvis.exceptions import AgentUnreachableError
+
+_logger = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# Tunables
+# --------------------------------------------------------------------------- #
+
+# How long the reader blocks in one ``_recv`` before waking to re-check the
+# stop/close flags. Small so a graceful ``stop()`` returns promptly; a warm
+# socket returns on the first frame regardless.
+READER_SOFT_TIMEOUT_S = 0.5
+
+# Bound on a single lane's pending-application queue. Deltas arrive at ~150ms
+# cumulative cadence, so 512 buffered frames is ~76s of un-applied stream — far
+# beyond any healthy apply lag. The bound exists so a pathologically slow apply
+# consumer can NEVER make the reader block or grow memory unboundedly:
+#   * LOSSY overflow (a delta) → drop the OLDEST buffered delta and count it;
+#     the next cumulative mirror supersedes the dropped frame (self-healing).
+#   * PRECIOUS overflow (a tool/terminal frame that cannot be dropped) →
+#     QUARANTINE the lane (park it for snapshot recovery) rather than lose a
+#     precious fact. Precious frames are rare, so this only fires under a truly
+#     wedged consumer.
+LANE_QUEUE_MAX = 512
+
+# CDX-13 lane-fairness: one ``dispatch`` drains at most LANE_QUANTUM events from a
+# single lane per round-robin pass, and at most DISPATCH_EVENT_BUDGET events overall
+# per call. A backed-up hot lane can therefore no longer monopolise the callback/DB/
+# publish work for hundreds of events before a cold lane is serviced — the passes
+# interleave the lanes, and any residue re-arms the wake so the next dispatch
+# continues at once (latency isolation between conversations on the single reader).
+LANE_QUANTUM = 32
+DISPATCH_EVENT_BUDGET = 512
+
+# Default RPC ack window (mirrors CONNECT_TIMEOUT_SECONDS) when a caller does
+# not pass its own timeout_s.
+DEFAULT_RPC_TIMEOUT_S = 10.0
+
+# R6 saved-reply glue: how much of an earlier segment's tail to remember so a
+# later join can find the boundary verbatim in the runtime's glued final text.
+# Only used to LOCATE the boundary (a find(), not a reconstruction), so it
+# only needs to be longer than any text the runtime could plausibly repeat
+# right before a boundary by coincidence.
+SEGMENT_TAIL_CHARS = 60
+
+# Per-shard poison-rate circuit breaker (OAR-7). When more than THRESHOLD lanes
+# quarantine within WINDOW seconds the breaker OPENS: it fires the alarm
+# callback once and (for callers that ask) refuses to re-adopt a run, so a
+# systematic delta/terminal-parse skew cannot loop every credit through the
+# recovery budget.
+POISON_BREAKER_THRESHOLD = 5
+POISON_BREAKER_WINDOW_S = 60.0
+
+# Integrity classes (D5 §4/§9 integrity-class law).
+LOSSY = "lossy"  # cumulative-mirror deltas — a dropped frame self-heals
+PRECIOUS = "precious"  # terminal + tool frames — must be applied exactly once
+
+
+# --------------------------------------------------------------------------- #
+# Bounded cancellable RPC future (§3 "bounded cancellable future")
+# --------------------------------------------------------------------------- #
+
+
+class RpcCancelled(Exception):
+	"""Raised by ``PendingRpc.result`` when a takeover/shutdown cancelled the
+	in-flight RPC (``stop()``) — distinct from an ``ack-timeout`` so the caller
+	knows the abandonment was deliberate, not a false gateway error."""
+
+
+class PendingRpc:
+	"""One outstanding RPC. Registered in the pending-RPC map at issuance and
+	resolved ON THE READER LOOP when the matching response frame arrives — a
+	non-blocking resolve, so the reader keeps draining broadcast frames for
+	OTHER turns while this RPC is outstanding (§3). Bounded (``result`` waits at
+	most ``timeout_s``, then raises the ``ack-timeout`` sentinel so the pump
+	parks for snapshot recovery instead of reporting a false error) and
+	cancellable (a takeover/shutdown abandons it without leaking)."""
+
+	def __init__(self, method: str, req_id: str, timeout_s: float):
+		self.method = method
+		self.req_id = req_id
+		self.timeout_s = timeout_s
+		self._event = threading.Event()
+		self._result: dict | None = None
+		self._exc: BaseException | None = None
+		self._on_settle: Callable[[str], None] | None = None
+
+	# -- reader-side resolution (called on the reader loop) --------------- #
+
+	def set_result(self, frame: dict) -> None:
+		if self._event.is_set():
+			return
+		self._result = frame
+		self._event.set()
+
+	def set_exception(self, exc: BaseException) -> None:
+		if self._event.is_set():
+			return
+		self._exc = exc
+		self._event.set()
+
+	def cancel(self) -> None:
+		self.set_exception(RpcCancelled(f"{self.method} cancelled"))
+
+	# -- caller-side await ------------------------------------------------ #
+
+	def result(self, timeout: float | None = None) -> dict:
+		"""Block until resolved, then return the response frame or raise. On the
+		bounded timeout raise the ``ack-timeout`` sentinel (ambiguous outcome:
+		the request frame was written, the peer may have accepted it — the pump
+		parks for recovery, never a false error)."""
+		wait_s = self.timeout_s if timeout is None else timeout
+		if not self._event.wait(wait_s):
+			# Remove ourselves so a late resolve doesn't linger in the map.
+			if self._on_settle is not None:
+				self._on_settle(self.req_id)
+			raise AgentUnreachableError(f"{self.method} timed out", code="ack-timeout")
+		if self._exc is not None:
+			raise self._exc
+		return self._result  # type: ignore[return-value]
+
+	@property
+	def done(self) -> bool:
+		return self._event.is_set()
+
+
+# --------------------------------------------------------------------------- #
+# Lane-event + per-turn lane
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _LaneEvent:
+	"""A decoded, class-tagged frame waiting to be applied to a lane."""
+
+	cls: str  # LOSSY | PRECIOUS
+	kind: str  # "delta" | "tool" | "status" | "step" | "terminal"
+	event_seq: int
+	data: dict
+
+
+@dataclass
+class LaneHandler:
+	"""The PUMP-PROVIDED callback set for one turn's lane — the contract WP-1c
+	wires to ``turn_state``. All callbacks are invoked ON THE PUMP THREAD (inside
+	``dispatch``), never on the reader loop, so the DB CAS they perform runs on a
+	thread that owns a frappe connection. All are optional (default no-op).
+
+	Callback signatures (see WP-1B report for the full contract):
+	  * ``on_delta(event_seq: int, text: str, delta: str, shown: str | None)`` — a
+	    cumulative-mirror assistant delta (LOSSY). ``text`` is the full cumulative
+	    text (what gets stored); ``delta`` is the incremental fragment; ``shown`` is
+	    what the chat displays (``text`` minus step text, see
+	    ``jarvis.chat.steps``), None when it equals ``text``. A raise ⇒
+	    drop+count+CONTINUE the SAME lane (OAR-7): the next mirror supersedes it.
+	  * ``on_tool(event: dict)`` — a tool start/end frame (PRECIOUS). ``event``
+	    has ``event_seq, phase, tool_name, tool_call_id, status, title``. A raise
+	    ⇒ QUARANTINE this lane only.
+	  * ``on_terminal(kind: str, payload: dict)`` — the run's terminal chat frame
+	    (PRECIOUS, applied exactly once). ``kind`` ∈ {``relay:final``,
+	    ``relay:error``}; ``payload`` = {``text``} for a final, or {``state``,
+	    ``error``, ``text``} for an error/aborted/failed_final (``text`` is the
+	    aborted terminal's own message text, empty for an agent-yield abort -
+	    see ``await_continuation``). A raise ⇒ QUARANTINE. May itself call
+	    ``await_continuation`` and return without settling - the mux then skips
+	    retiring the lane (``_apply`` checks ``lane.awaiting`` after the call).
+	  * ``on_quarantine(reason: str)`` — the mux fenced this lane off (precious
+	    fault, precious overflow). The pump parks the turn toward ``recovering``.
+	  * ``on_closing(sentinel: str)`` — the socket died: this lane lost its
+	    transport. The pump re-attaches from durable state on the next hop.
+	  * ``on_status(event_seq: int, status: str)`` — a transient run-status
+	    marker (e.g. an in-flight compaction) (LOSSY, like a delta): a raise
+	    drops the frame, counts it, and continues the same lane.
+	  * ``on_step(event_seq: int, text: str, raw: str | None, preamble: bool)`` —
+	    the live step line: one line saying what the model is doing right now
+	    (LOSSY). ``raw`` is the step's full text when it is also in the reply,
+	    kept so a re-adopted lane can re-seed it; ``preamble`` is True when the
+	    runtime flagged it (the saved reply strips it), kept for the same re-seed.
+	    See ``jarvis.chat.steps``.
+	"""
+
+	on_delta: Callable[[int, str, str, str | None], None] | None = None
+	on_tool: Callable[[dict], None] | None = None
+	on_terminal: Callable[[str, dict], None] | None = None
+	on_quarantine: Callable[[str], None] | None = None
+	on_closing: Callable[[str], None] | None = None
+	on_status: Callable[[int, str], None] | None = None
+	on_step: Callable[[int, str, str | None, bool], None] | None = None
+
+
+class _Lane:
+	"""One per-turn lane — the unit of quarantine (D5 §5). Holds the turn's
+	bounded pending-application queue, its watermark cursor (the last event_seq
+	the mux ASSIGNED — monotonic, seeded from the pump-supplied ``start_seq`` so
+	the DB watermark stays monotonic across a re-attach), and its callbacks."""
+
+	def __init__(self, run_id: str, handler: LaneHandler, *, session_key: str, start_seq: int):
+		self.run_id = run_id
+		self.session_key = session_key
+		self.handler = handler
+		self.lock = threading.Lock()
+		self.queue: deque[_LaneEvent] = deque()
+		self.watermark = int(start_seq)
+		self.state = "active"  # active | quarantined | terminal | closed
+		self.poison_count = 0
+		# agent-yield continuation wait (image/video/music tools' unconditional
+		# background-detach abort, see pump.on_terminal): True while this lane is
+		# parked waiting for a follow-up chat terminal under a FRESH runId on the
+		# SAME sessionKey. ``state`` stays "active" (the queue keeps accepting) -
+		# this is a separate flag so ``_apply`` skips retiring the lane at its
+		# (yielded) terminal and ``_route_event`` knows an unknown runId on this
+		# session may still belong here.
+		self.awaiting = False
+		# Last lifecycle error text seen for this run (#543). Written and read on
+		# the READER thread only (both _route_agent and _route_terminal run
+		# there), so it needs no lock. Not terminal on its own: it just names the
+		# provider failure for a terminal that otherwise cannot.
+		self.failure_detail: str | None = None
+		# True once a MEDIA_GEN_TOOL_NAMES tool call started on this run.
+		# Written in _route_agent, read in _route_terminal (same reader-thread-
+		# only discipline as failure_detail): the gateway's bare terminal for a
+		# yielded run with no visible output is wire-identical to a genuine
+		# failed_final, and this in-flight history is the only thing that
+		# tells them apart.
+		self.saw_media_tool_start = False
+		# True once this lane has been adopted onto a fresh runId by
+		# _route_event (the deferred tool's follow-up run on the same
+		# sessionKey). Set at adoption, read in _route_terminal so its
+		# eventual final's terminal payload can be marked "yield_continuation"
+		# for the caller's post-settle rich-output step.
+		self.is_continuation = False
+		# Live step line (jarvis.chat.steps), reader-thread only like the fields
+		# above. ``stream_text`` is the last raw reply text and ``since_tool`` the
+		# offset in it where the latest tool call started; ``steps`` is the step
+		# text recorded so far (in order, seeded on a hop re-attach) and
+		# ``shown_text`` what the chat displays: ``stream_text`` minus its steps.
+		self.stream_text = ""
+		self.since_tool = 0
+		self.steps: list[str] = []
+		# The texts in ``steps`` that came from a runtime-flagged preamble
+		# (_record_preamble_step), reader-thread only like ``steps``. Re-seeded
+		# on a pump hop from the pump's preamble cache (register_run's
+		# ``preamble_steps=``); a flag lost with that cache falls back to is_step.
+		self.preamble_steps: set[str] = set()
+		self.shown_text = ""
+		# R6 saved-reply glue: the tail of each earlier segment (relay_mux
+		# module docstring / _reply_delta), reader-thread only like the steps
+		# above. Known limit: a pump hop rebuilds the lane from register_run's
+		# ``steps=`` (pump.py._reattach_lane), which re-seeds recorded steps
+		# but NOT this list - a hop mid-turn loses the boundaries recorded
+		# before it, so a segment glued right before a hop stays glued in the
+		# saved reply. Accepted (the same known limit steps.py's module
+		# docstring already documents for the pre-hop step text); no cache is
+		# built for it, deliberately (see the plan's R6 note).
+		self.segment_tails: list[str] = []
+		# PUMP-thread-owned record of the text the user last actually SAW via a
+		# delivered on_delta (including a terminal's reshow) - updated in
+		# _apply, read in _finalize_terminal for the reshow decision.
+		# Deliberately separate from shown_text above (reader-owned, updated as
+		# frames stream in): a terminal's reshow is delivered ON THE PUMP
+		# THREAD and never feeds back into a reader-owned field (only the
+		# reader thread ever writes shown_text/stream_text/steps - see this
+		# file's HARD INVARIANTS). Never touched by the reader thread, so it
+		# needs no lock.
+		self.last_shown = ""
+
+	def next_seq(self) -> int:
+		self.watermark += 1
+		return self.watermark
+
+	def offer(self, ev: _LaneEvent) -> str:
+		"""Reader-side, non-blocking enqueue. Returns:
+		* ``"ok"``        — buffered.
+		* ``"dropped"``   — LOSSY overflow: an old delta was dropped (count it).
+		* ``"quarantine"``— PRECIOUS overflow: the lane must be quarantined.
+		* ``"closed"``    — lane is no longer active (drop, treat as stray)."""
+		with self.lock:
+			if self.state != "active":
+				return "closed"
+			if len(self.queue) < LANE_QUEUE_MAX:
+				self.queue.append(ev)
+				return "ok"
+			# Full.
+			if ev.cls == LOSSY:
+				# Drop the OLDEST lossy delta to make room (self-healing mirror).
+				for i, old in enumerate(self.queue):
+					if old.cls == LOSSY:
+						del self.queue[i]
+						self.queue.append(ev)
+						return "dropped"
+				# No lossy frame to evict (queue is all precious): drop incoming.
+				return "dropped"
+			# Precious frame cannot be dropped and cannot fit → quarantine.
+			self.state = "quarantined"
+			return "quarantine"
+
+	def drain(self, max_events: int | None = None) -> list[_LaneEvent]:
+		"""Pump-side: pop up to ``max_events`` currently-buffered events (all when
+		None) under the lane lock, then release it BEFORE the caller applies them (so a
+		slow callback never blocks the reader's ``offer``). CDX-13: the bounded pop is
+		the per-lane quantum that keeps a hot lane from starving the others in one
+		``dispatch`` pass."""
+		with self.lock:
+			if not self.queue:
+				return []
+			if max_events is None or max_events >= len(self.queue):
+				events = list(self.queue)
+				self.queue.clear()
+				return events
+			return [self.queue.popleft() for _ in range(max_events)]
+
+
+# --------------------------------------------------------------------------- #
+# The multiplexer
+# --------------------------------------------------------------------------- #
+
+
+class RelayMux:
+	"""One-reader WS multiplexer for one ``relay_target_id``.
+
+	Construct it with an already-connected ``AgentSession`` (the pump owns
+	connect/reconnect — the mux is the I/O adapter on a given socket). Call
+	``start()`` to spawn the reader; the pump then registers runs, issues RPCs,
+	and calls ``dispatch()`` to apply buffered frames.
+	"""
+
+	def __init__(
+		self,
+		session: AgentSession,
+		relay_target_id: str,
+		*,
+		on_breaker: Callable[[str, int], None] | None = None,
+		breaker_threshold: int = POISON_BREAKER_THRESHOLD,
+		breaker_window_s: float = POISON_BREAKER_WINDOW_S,
+	):
+		self._session = session
+		self.relay_target_id = relay_target_id
+
+		# pending-RPC map: req_id -> PendingRpc
+		self._pending: dict[str, PendingRpc] = {}
+		self._pending_lock = threading.Lock()
+
+		# run map: gateway_run_id -> _Lane  (+ deferred-quarantine handoff list)
+		self._runs: dict[str, _Lane] = {}
+		self._quarantine_pending: list[tuple[_Lane, str]] = []
+		self._map_lock = threading.Lock()
+		# session_key -> the (dead) runId a lane is parked under while awaiting an
+		# agent-yield continuation (see ``await_continuation``). Guarded by
+		# ``_map_lock`` like ``_runs``.
+		self._awaiting: dict[str, str] = {}
+
+		# reader-loop lifecycle
+		self._reader: threading.Thread | None = None
+		self._stopping = threading.Event()  # graceful stop requested
+		self._closed = threading.Event()  # socket dead / torn down
+		self._wake = threading.Event()  # reader poked dispatch: work available
+		# #773: a write that started and failed poisons the transport immediately, so
+		# the slice loop stops before the reader has even noticed the abort.
+		self._poisoned = threading.Event()
+		# Monotonic instant no write may run past (the pump's lease bound); None = no bound.
+		self._write_deadline: float | None = None
+
+		# circuit breaker
+		self._on_breaker = on_breaker
+		self._breaker_threshold = breaker_threshold
+		self._breaker_window_s = breaker_window_s
+		self._quarantine_times: deque[float] = deque()
+		self._breaker_open = False
+		self._breaker_lock = threading.Lock()
+
+		# telemetry counters (Amendment I)
+		self._counter_lock = threading.Lock()
+		self._stray_frames = 0
+		self._deltas_dropped = 0
+		self._lanes_quarantined = 0
+		self._rpc_failed_on_close = 0
+		self._chat_delta_ignored = 0
+		# A reader-thread routing bug on a KNOWN lane (distinct from an ordinary
+		# stray/late/unknown frame): see _on_reader_fault. Should stay at 0 in
+		# healthy operation - any nonzero count here is a bug, not routine noise.
+		self._reader_errors = 0
+		# #773: writes refused before any byte (``SendNotStarted``), and transports
+		# poisoned by a write (started-and-failed, or a socket error before its first byte).
+		self._writes_refused = 0
+		self._writes_poisoned = 0
+
+	# -- lifecycle ---------------------------------------------------------- #
+
+	def start(self) -> RelayMux:
+		"""Spawn the single reader thread. Idempotent-ish: start once per mux."""
+		if self._reader is not None:
+			raise RuntimeError("RelayMux.start() called twice")
+		self._reader = threading.Thread(
+			target=self._read_loop, name=f"relay-mux-{self.relay_target_id}", daemon=True
+		)
+		self._reader.start()
+		return self
+
+	def stop(self, *, timeout: float = 5.0) -> None:
+		"""Graceful teardown (hop end / takeover). Stops the reader, flushes any
+		quarantine deferred right before teardown, CANCELS every in-flight RPC
+		(so no awaiter dead-waits), and closes the socket. Does NOT fire
+		``on_closing`` - a graceful stop is not transport loss; the durable turn
+		state persists and the next hop re-attaches."""
+		self._stopping.set()
+		self._wake.set()
+		if self._reader is not None:
+			self._reader.join(timeout=timeout)
+		# A reader fault or precious-overflow queued right before teardown (see
+		# _on_reader_fault / _offer) must still reach on_quarantine here: this
+		# IS hop teardown, so the caller may never call dispatch() again this
+		# hop, and without this flush a lost terminal would silently wait for
+		# the ~90s snapshot-recovery path instead - the exact regression this
+		# file fixes elsewhere. Safe here: the reader thread has already
+		# joined (nothing more can append to _quarantine_pending), and stop(),
+		# like dispatch(), runs on the pump thread. A graceful stop can never
+		# race _begin_closing (a transport loss): that path already clears
+		# _quarantine_pending itself before firing on_closing, so there is
+		# nothing left here for it to double-notify.
+		self._flush_deferred_quarantines()
+		self._cancel_all_pending()
+		self._closed.set()
+		try:
+			self._session.close()
+		except Exception:
+			pass
+
+	def is_closed(self) -> bool:
+		return self._closed.is_set() or self._poisoned.is_set()
+
+	def set_write_deadline(self, deadline: float | None) -> None:
+		"""No write may run past ``deadline`` (monotonic): a write that could not finish
+		by then is refused with ``SendNotStarted`` before any byte goes out."""
+		self._write_deadline = deadline
+
+	def is_breaker_open(self) -> bool:
+		with self._breaker_lock:
+			return self._breaker_open
+
+	def poke(self) -> None:
+		"""C1 (WP-2 Stage B): wake a slice blocked in ``dispatch(block_s>0)`` from
+		OUTSIDE the reader loop. The pump's wake-bus thread calls this the instant an
+		accept LPUSHes the cross-process wake bus, so the slice's idle block waits on
+		whichever of {a delivered frame, a resolved ack, an accept wake} fires first —
+		no polling theatre. Setting the same ``_wake`` Event the reader uses keeps the
+		block single-sourced; a spurious poke costs at most one no-op drain."""
+		self._wake.set()
+
+	# -- reader loop (the sole _recv owner, R-15) --------------------------- #
+
+	def _read_loop(self) -> None:
+		while not self._stopping.is_set():
+			try:
+				frame = self._session._recv(READER_SOFT_TIMEOUT_S)
+			except AgentUnreachableError as exc:
+				# Socket failure — the ONLY hop-ending cause this module observes
+				# directly (§2/§5). Everything else routes back to reading.
+				self._begin_closing(exc)
+				return
+			except Exception as exc:  # pragma: no cover - defensive
+				self._begin_closing(AgentUnreachableError(f"reader loop error: {exc}"))
+				return
+			if frame is None:
+				# soft timeout / non-JSON noise (swallowed by _recv) — never crash
+				continue
+			try:
+				self._classify(frame)
+			except Exception:  # pragma: no cover - a classify bug must not kill the hop
+				self._bump("stray_frames")
+				_logger.debug("relay_mux: classify raised on frame; counted as stray", exc_info=True)
+		# graceful stop path: reader observed the stop flag
+		self._closed.set()
+
+	def _classify(self, frame: dict) -> None:
+		ftype = frame.get("type")
+		if ftype == "res":
+			self._resolve_response(frame)
+			return
+		if ftype == "event":
+			self._route_event(frame)
+			return
+		# Unknown frame type — late/unknown/noise (D5 rule 4). Count, never crash.
+		self._bump("stray_frames")
+
+	def _resolve_response(self, frame: dict) -> None:
+		req_id = frame.get("id")
+		with self._pending_lock:
+			fut = self._pending.pop(req_id, None)
+		if fut is None:
+			# response to an unknown/already-settled request id → stray.
+			self._bump("stray_frames")
+			return
+		if not frame.get("ok"):
+			# Preserve today's structured error classification (code + details)
+			# so the issuing pump path classifies stale-pairing etc. as it does
+			# now (agent_client._request:1023-1030).
+			err = frame.get("error") or {}
+			details = err.get("details")
+			fut.set_exception(
+				AgentUnreachableError(
+					f"{fut.method} rejected: {err.get('code', '?')}: {err.get('message', '')}",
+					code=err.get("code"),
+					details=details if isinstance(details, dict) else None,
+				)
+			)
+			# C1 (WP-2 Stage B): a resolved RPC is a delivery too — poke the block so a
+			# slice waiting in dispatch() wakes AT ONCE (see set_result path below).
+			self._wake.set()
+			return
+		fut.set_result(frame)
+		# C1 (WP-2 Stage B): the chat.send ack resolves HERE, on the reader loop. Set
+		# the same wake Event a delivered frame sets so the pump's slice returns from
+		# its idle block immediately and _poll_acks runs mark_streaming this slice —
+		# instead of dead-blocking to the SLICE_BLOCK_S poll ceiling before the turn
+		# can leave `dispatching` and stream its first token.
+		self._wake.set()
+
+	def _route_event(self, frame: dict) -> None:
+		event = frame.get("event")
+		payload = frame.get("payload") or {}
+		run_id = payload.get("runId")
+		if not run_id:
+			self._bump("stray_frames")
+			return
+		sk = payload.get("sessionKey")
+		with self._map_lock:
+			lane = self._runs.get(run_id)
+			if lane is not None and lane.awaiting:
+				# A frame under the STILL-PARKED (dead) original runId - the agent runtime
+				# never posts anything more under an id it already retired, so
+				# this is stale/stray. Only a frame carrying a NEW runId on the
+				# same sessionKey (handled below) may un-park this lane.
+				lane = None
+			if lane is None and event == "chat" and sk:
+				# agent-yield continuation (OAR-image-defer): an unknown runId's
+				# CHAT frame (only chat frames carry sessionKey) may be the deferred
+				# tool's follow-up run on a lane parked by ``await_continuation``.
+				# Adopt it in place (mirrors ``rekey_run``, inlined - it takes this
+				# same lock). Only chat frames adopt; the continuation's own
+				# tool/delta ``agent`` frames arrive under the now-known runId on a
+				# LATER frame and route normally from then on.
+				old_run_id = self._awaiting.get(sk)
+				if old_run_id is not None and old_run_id != run_id:
+					# Must be a NEW runId - a frame replaying the SAME dead id
+					# (e.g. a stray chat delta) is stray, never an adoption.
+					lane = self._runs.pop(old_run_id, None)
+					if lane is not None:
+						lane.run_id = run_id
+						lane.awaiting = False
+						lane.is_continuation = True
+						self._runs[run_id] = lane
+					self._awaiting.pop(sk, None)
+		if lane is None:
+			# Unknown/late/foreign runId (drop-and-count is the safe fallback,
+			# R-16 / OAR-15): no frame of OUR fresh run can precede its ack, and
+			# a genuinely-unknown id is a late or foreign frame.
+			self._bump("stray_frames")
+			return
+		# Defensive sessionKey cross-check (runId is globally unique, so this only
+		# guards against a foreign frame that happens to reuse an id).
+		if event == "chat" and lane.session_key and sk and sk != lane.session_key:
+			self._bump("stray_frames")
+			return
+		if event == "agent":
+			try:
+				self._route_agent(lane, payload)
+			except Exception:
+				self._on_reader_fault(lane, "agent", payload)
+		elif event == "chat":
+			try:
+				self._route_terminal(lane, payload)
+			except Exception:
+				self._on_reader_fault(lane, "chat", payload)
+		else:
+			self._bump("stray_frames")
+
+	def _on_reader_fault(self, lane: _Lane, event: str, payload: dict) -> None:
+		"""A routing bug on a KNOWN lane must never vanish as an ordinary stray
+		frame again (the #1449 regression: a Frappe call's AttributeError escaped
+		``_route_terminal``, was swallowed by ``_read_loop``'s generic classify
+		catch, and counted as a "stray_frames" - indistinguishable from harmless
+		wire noise. The run then sat ``streaming`` until the NEXT pump hop's
+		~90s snapshot-recovery poll, which is the whole bug).
+
+		Count it distinctly (``reader_errors``, see :meth:`stats`) and log it with
+		the stdlib logger - no Frappe logger on this thread, and the frame kind +
+		run id are always in the message so a fault is diagnosable from the log
+		line alone. When the lost frame was the run's own TERMINAL AND the lane
+		was still active, do not let it wait for the natural hop boundary: hand
+		the lane to the pump's EXISTING precious-overflow quarantine handoff
+		(``_defer_quarantine`` -> ``dispatch()``'s ``_flush_deferred_quarantines``
+		-> ``on_quarantine`` -> the pump's ``_park_recovering``), so the turn
+		parks toward recovery on the very next ``dispatch()`` call (a fraction of
+		a second away) instead of at hop end."""
+		self._bump("reader_errors")
+		_logger.warning(
+			"relay_mux: reader thread error routing a %s frame for run=%s", event, lane.run_id, exc_info=True
+		)
+		if event != "chat" or payload.get("state") not in ("final", "error", "aborted"):
+			return
+		with lane.lock:
+			if lane.state != "active":
+				# Already retired (the REAL terminal already applied) or fenced
+				# off some other way (quarantined/closed) - a duplicate or
+				# replayed terminal frame racing that outcome must never fire
+				# on_quarantine for a turn that already settled, and must never
+				# feed the poison-rate breaker for a fault that is not an actual
+				# loss (same check-under-lock idiom as _quarantine's own).
+				return
+			lane.state = "quarantined"
+		self._defer_quarantine(lane, "reader_fault")
+
+	def _route_agent(self, lane: _Lane, payload: dict) -> None:
+		# redact=False: this runs on the reader thread, which has no frappe.local
+		# site. The pump redacts the text fields itself, on its own thread, in
+		# _apply, right before they reach a lane callback.
+		parsed = parse_event(payload, redact=False, collaboration=":dashboard:collab:" in lane.session_key)
+		if parsed and parsed.get("kind") == "tool_boundary" and parsed.get("tool_call_id"):
+			parsed = {**parsed, "kind": "tool", "phase": "start"}
+		if parsed is None or parsed.get("kind") == "lifecycle":
+			# lifecycle frames are dropped on the managed relay path (mirror of
+			# relay_turn_events); not a stray — it's an expected known-run drop.
+			# The ``error`` phase is the only frame that names the provider
+			# failure, so keep its text on the lane for a failed final (#543).
+			if parsed is not None and parsed.get("phase") == "error" and parsed.get("error"):
+				lane.failure_detail = str(parsed["error"])
+			return
+		kind = parsed.get("kind")
+		if kind == "assistant":
+			ev = self._reply_delta(lane, parsed)
+		elif kind == "step":
+			self._route_preamble_step(lane, parsed.get("text", ""))
+			return
+		elif kind == "tool_boundary":
+			self._move_pending_step(lane)
+			return
+		elif kind == "tool":
+			if parsed.get("phase") == "start" and parsed.get("tool_name") in MEDIA_GEN_TOOL_NAMES:
+				lane.saw_media_tool_start = True
+			if parsed.get("phase") == "start":
+				self._move_pending_step(lane)
+			seq = lane.next_seq()
+			ev = _LaneEvent(
+				cls=PRECIOUS,
+				kind="tool",
+				event_seq=seq,
+				data={
+					"phase": parsed.get("phase"),
+					"tool_name": parsed.get("tool_name"),
+					"tool_call_id": parsed.get("tool_call_id"),
+					"status": parsed.get("status"),
+					"title": parsed.get("tool_title"),
+				},
+			)
+		elif kind == "compaction":
+			seq = lane.next_seq()
+			ev = _LaneEvent(
+				cls=LOSSY,
+				kind="status",
+				event_seq=seq,
+				data={"status": "compacting" if parsed.get("phase") == "start" else "compacted"},
+			)
+		else:  # pragma: no cover - parse_event only yields the kinds above
+			return
+		self._offer(lane, ev)
+
+	def _reply_delta(self, lane: _Lane, parsed: dict) -> _LaneEvent:
+		"""A reply-text frame. ``text`` stays raw (the stored mirror keeps exactly
+		what streamed, so a stop, error or recovery behaves as before); ``shown``
+		is what the chat displays, with recorded steps cut out."""
+		text = parsed.get("text", "")
+		if not text.startswith(lane.stream_text):
+			# An API-key model's next call starts a fresh segment. Remember
+			# the outgoing segment's tail (R6) BEFORE it is overwritten below,
+			# so the terminal can later find this exact boundary in the
+			# runtime's glued-with-no-separator final text and re-insert a
+			# paragraph break there.
+			if lane.stream_text:
+				tail = lane.stream_text[-SEGMENT_TAIL_CHARS:]
+				if tail:
+					lane.segment_tails.append(tail)
+			lane.since_tool = 0
+		lane.stream_text = text
+		return self._shown_delta(lane, remove_steps(text, lane.steps), parsed.get("delta", ""))
+
+	def _move_pending_step(self, lane: _Lane) -> None:
+		"""At a tool call: if the reply text written since the previous tool call
+		is a short run of narration (is_step: one line, up to three sentences), it was
+		a step. Show it on the step line and take it out of the live display.
+		Anything longer stays in the reply."""
+		pending = remove_steps(lane.stream_text[lane.since_tool :], lane.steps).strip()
+		lane.since_tool = len(lane.stream_text)
+		if not is_step(pending):
+			return
+		lane.steps.append(pending)
+		# Hide it first, then show the step: the pump flushes batched deltas
+		# before publishing a step, so the bubble clears at once even on the
+		# Claude runtime, where no tool event follows to force that flush.
+		self._offer(lane, self._shown_delta(lane, remove_steps(lane.stream_text, lane.steps)))
+		self._offer_step(lane, pending, raw=pending)
+
+	def _route_preamble_step(self, lane: _Lane, text: str) -> None:
+		"""A preamble update (events.parse_event's kind=="step", the runtime's
+		separate "item/kind=preamble" frame - root cause B, live capture
+		2026-09-25). The pooled openai-completions runtime sends this for text
+		that is ALSO streaming as ordinary reply text, so routing it straight to
+		_offer_step (as before this method existed) shows the same text twice:
+		on the step line and in the reply bubble, until the next tool call's
+		_move_pending_step catches up - or never, for narration longer than
+		is_step's limit, which then stays glued into the saved
+		reply too (before strip_preambles).
+
+		When the (stripped) text is already sitting in the reply written since
+		the last tool call AND passes ``is_preamble_step`` (R4, looser than
+		is_step - MAX_PREAMBLE_STEP_CHARS), treat it as that reply text arriving
+		early: record + hide it now, same order _move_pending_step uses at the
+		tool boundary, so the boundary later finds nothing left to move and never
+		double-offers. The saved reply drops it too (steps.strip_preambles) unless
+		nothing else would remain. Otherwise (a genuine harness preamble never in the reply -
+		Codex direct mode - or text that fails is_preamble_step, including every
+		preamble when MAX_PREAMBLE_STEP_CHARS=0) keep today's path: offered on
+		the step line only, raw=None, untouched in the reply.
+		"""
+		stripped = (text or "").strip()
+		# Anchored: the preamble IS the reply written since the last tool call
+		# (or a growing prefix of it), or, once earlier preambles in that stretch
+		# are recorded, the reply that follows them. A bare substring test could
+		# match a short preamble ("I see.") inside the answer and cut it there.
+		region = lane.stream_text[lane.since_tool :]
+		# A step this text grows out of stays in ``rest``: removing its partial
+		# too would leave only the tail, and the grown text would not anchor.
+		rest = remove_steps(region, [s for s in lane.steps if not stripped.startswith(s)])
+		anchored = region.lstrip().startswith(stripped) or rest.lstrip().startswith(stripped)
+		if stripped and anchored and is_preamble_step(stripped):
+			self._record_preamble_step(lane, stripped)
+			return
+		self._offer_step(lane, text)
+
+	def _record_preamble_step(self, lane: _Lane, text: str) -> None:
+		"""Record an in-reply preamble as a step and hide it, same shape
+		_move_pending_step uses (hide delta first, then the step, raw=text).
+
+		The runtime resends the same progressText across update/end frames (and
+		sometimes a growing prefix of it): a duplicate of an already-recorded
+		step is dropped (never re-recorded, never re-offered); a text that
+		extends the last recorded step REPLACES it rather than appending, or a
+		stale shorter entry would still sit in lane.steps ahead of the longer
+		one and remove_steps would cut only the short prefix, leaving the rest
+		dangling in the saved reply.
+		"""
+		if text in lane.steps:
+			lane.preamble_steps.add(text)
+			return
+		# A growing resend replaces the step it extends, in place, whichever
+		# recorded step that is (not only the last), so order and the cache
+		# collapse (steps.collapse_steps) agree. Only a step still in the reply
+		# since the last tool call can be growing; an older segment's step that
+		# merely prefixes this text must stay recorded, or it is never stripped.
+		region = lane.stream_text[lane.since_tool :]
+		for i, step in enumerate(lane.steps):
+			if text.startswith(step) and step in region:
+				lane.preamble_steps.discard(step)
+				lane.steps[i] = text
+				break
+		else:
+			lane.steps.append(text)
+		lane.preamble_steps.add(text)
+		self._offer(lane, self._shown_delta(lane, remove_steps(lane.stream_text, lane.steps)))
+		self._offer_step(lane, text, raw=text, preamble=True)
+
+	def _shown_delta(self, lane: _Lane, shown: str, delta: str = "") -> _LaneEvent:
+		"""The one delta shape: raw ``stream_text`` for the mirror, ``shown`` for the chat."""
+		lane.shown_text = shown
+		return _LaneEvent(
+			cls=LOSSY,
+			kind="delta",
+			event_seq=lane.next_seq(),
+			data={"text": lane.stream_text, "delta": delta, "shown": shown},
+		)
+
+	def _offer_step(self, lane: _Lane, text: str, raw: str | None = None, preamble: bool = False) -> None:
+		"""``raw`` is set for step text that is also in the reply (so the pump
+		keeps it across a hop); the ChatGPT harness's separate updates have none.
+		``preamble`` marks a runtime-flagged one, which the pump also keeps so a
+		re-adopted lane still strips it from the saved reply.
+		``text`` rides the queue FULL and RAW - ``display_line``'s shaping
+		(prose extraction + the 160-char truncation) runs on the PUMP thread,
+		AFTER redaction (see ``_apply``): truncating before redacting could cut
+		a forbidden word in half and leak the surviving fragment. The blank
+		check below is a cheap pre-filter only (a preamble's caller already
+		drops an all-whitespace ``progressText`` before this is ever reached -
+		see ``events.parse_event``); the real "is there anything to show"
+		decision needs display_line's own prose-extraction (a table-only line,
+		for instance) and runs on the pump thread with the redaction."""
+		if not (text or "").strip():
+			return
+		self._offer(
+			lane,
+			_LaneEvent(
+				cls=LOSSY,
+				kind="step",
+				event_seq=lane.next_seq(),
+				data={"text": text, "raw": raw, "preamble": preamble},
+			),
+		)
+
+	def _route_terminal(self, lane: _Lane, payload: dict) -> None:
+		"""Classify the chat terminal frame and enqueue its RAW fields. PURE
+		Python only, top to bottom - no Frappe call lives on this path any more
+		(the #1449 regression: ``egress_rules``/``generated_media`` need a site DB
+		connection this reader thread does not have). The classifiers below
+		(``_chat_final_text`` etc.) are total, pure functions; the actual
+		media-marker handling, egress redaction and step-stripping now run on the
+		PUMP thread, in ``_finalize_terminal`` (called from ``_apply``, which
+		``dispatch()`` guarantees runs there)."""
+		state = payload.get("state")
+		if state == "final":
+			text = _chat_final_text(payload)
+			failed = _chat_final_failed(payload, text)
+			if _is_yield_aborted_final(payload, text) or (failed and lane.saw_media_tool_start):
+				# The runtime's image/video/music tools' unconditional
+				# background-detach yield reaches THIS path too (not only
+				# state=="aborted" below): a `final` whose text is empty and
+				# whose stopReason (top-level or nested in message) is
+				# "aborted", not "error" - OR, when the gateway settles a
+				# yielded run with NO stopReason at all (a bare terminal,
+				# wire-identical to a genuine failed_final), the fact that a
+				# media-gen tool started this run is the only tell. Same
+				# relay:error/aborted shape as the state=="aborted" branch, so
+				# on_terminal's yield-wait applies unchanged. MUST come before
+				# the failed_final branch below - both of its "no message"/
+				# "no signal" guards would otherwise call this a hard failure
+				# instead of a deferred reply.
+				raw: dict = {"kind_hint": "yield_aborted"}
+			elif failed:
+				raw = {"kind_hint": "failed_final", "failure_detail": lane.failure_detail}
+			else:
+				# Not a failed-final. The pump will detect the MEDIA marker,
+				# step-strip the reply, then redact it once, then may need to
+				# re-show text the live view had hidden - BEFORE the terminal -
+				# so reserve that delta's seq now, on this thread (the sole
+				# next_seq() caller): whether it ends up used is decided later,
+				# on the pump thread, once egress redaction has run, but the
+				# ordering must be fixed here. An unused reserved seq just
+				# leaves a harmless gap in the watermark, same as any lossy drop.
+				raw = {
+					"kind_hint": "final",
+					"text": text,
+					"steps": list(lane.steps),
+					"preamble_steps": [s for s in lane.steps if s in lane.preamble_steps],
+					# R6: segment tails recorded so far (see _Lane.segment_tails)
+					# so _finalize_terminal can glue the runtime's separator-
+					# free segment boundaries back together on the pump thread.
+					"tails": list(lane.segment_tails),
+					"stream_text": lane.stream_text,
+					"is_continuation": lane.is_continuation,
+					"media_urls": _chat_final_media_urls(payload),
+					"run_id": lane.run_id,
+					"reshow_seq": lane.next_seq(),
+				}
+		elif state in ("error", "aborted"):
+			# "text" lets pump.on_terminal tell an agent-yield abort (empty)
+			# from a genuine partial-content abort (image/video/music tools'
+			# unconditional background-detach, see YIELD_CONTINUATION_WAIT_S).
+			# Harmless addition for every other consumer of this payload shape.
+			raw = {
+				"kind_hint": "error",
+				"state": state,
+				"error_message": payload.get("errorMessage") or state,
+				"text": _chat_final_text(payload) or "",
+			}
+		else:
+			# chat state=delta (the 150ms cumulative mirror) and unknown states
+			# are ignored — the tokens ride the `agent` frames (mirror of
+			# relay_turn_events:779). Known run, expected drop — not stray.
+			self._bump("chat_delta_ignored")
+			return
+		seq = lane.next_seq()
+		ev = _LaneEvent(cls=PRECIOUS, kind="terminal", event_seq=seq, data=raw)
+		self._offer(lane, ev)
+
+	def _finalize_terminal(self, lane: _Lane, ev: _LaneEvent) -> tuple[str, dict, dict | None]:
+		"""The terminal's Frappe-dependent finishing work: detect the MEDIA
+		marker on the raw reply, step-strip the raw reply, then redact the
+		result ONCE (firing the once-per-turn tripwire on a hit) - classification
+		already ran on raw text, on the reader thread, in ``_route_terminal``.
+		MUST run on the pump thread - called from ``_apply``, which
+		``dispatch()`` guarantees; ``egress_rules`` and ``generated_media`` both
+		need a live site DB connection, which is exactly what the reader thread
+		does not have (this file's HARD INVARIANTS).
+
+		Returns ``(term_kind, term_payload, reshow)`` where ``reshow`` is the
+		pre-terminal "re-show text the live view had hidden" delta to apply
+		first, or ``None`` when no such delta is needed."""
+		raw = ev.data
+		kind_hint = raw["kind_hint"]
+		if kind_hint == "yield_aborted":
+			return "relay:error", {"state": "aborted", "text": ""}, None
+		if kind_hint == "failed_final":
+			error = failed_final_error(raw["failure_detail"])
+			return "relay:error", {"state": "failed_final", "error": error}, None
+		if kind_hint == "error":
+			error = egress_rules.redact(raw["error_message"])
+			return "relay:error", {"state": raw["state"], "error": error, "text": raw["text"]}, None
+		# kind_hint == "final". media_rels/marker_stripped ride term_payload ->
+		# the Turn row, where finalize._effect_rich_outputs re-reads media_rels
+		# to seed the image (the pump is the default transport, so this is the
+		# primary delivery path). Detected on the RAW text, BEFORE step-strip -
+		# exactly what redact_final_with_media always detected before this file
+		# moved off the reader thread - so a marker/path line the model wrote
+		# next to a step is never missed just because the step-strip below
+		# happens to remove that neighbouring line.
+		rels = detect_media_paths(raw["text"])
+		marked = has_media_marker(raw["text"]) or has_embedded_media_path(raw["text"])
+		# R6: re-insert the paragraph break the runtime's own glued-segment
+		# boundaries dropped, BEFORE step-strip and redaction (a tail is a
+		# verbatim substring of the RAW text only; strip_steps below would
+		# already absorb an inserted break sitting right next to a step it
+		# removes, via remove_steps' own lstrip, so ordering it first is safe
+		# either way). Then strip the RAW recorded steps that qualify (see the
+		# C1 comment below) from the RAW text, then redact the result ONCE.
+		# Both sides of strip_steps must be
+		# exact, verbatim substrings of the SAME text for its search to work;
+		# redacting the whole text and the recorded steps SEPARATELY (as this
+		# file briefly did) can diverge for a context-spanning egress rule - a
+		# pattern that only matches with surrounding text present redacts a
+		# step differently in isolation than it does inside the whole reply -
+		# so the step no longer matches its (differently-redacted) counterpart
+		# inside the final text and is left sitting in the saved reply instead
+		# of being stripped like every other step. Redacting once, after
+		# stripping, has no such divergence: there is only one piece of text
+		# and one pass.
+		joined = join_segments(raw["text"], raw["tails"])
+		# A step the runtime flagged as a preamble (lane.preamble_steps) is
+		# hidden live, so it never comes back into the saved reply: it is cut
+		# whenever any answer text remains (strip_preambles), else the reply
+		# stays whole. Before, a two-sentence preamble, or a one-sentence one
+		# followed by a shorter answer (strip_steps' keep-whole guard), stayed
+		# in the saved reply and the reshow flashed the narration back into
+		# the finished answer. Every other step (text before a tool call,
+		# lane.steps from the Claude/API-key runtimes) keeps the is_step rule
+		# and strip_steps' guard. A pump hop re-seeds lane.steps and these flags
+		# from the pump's caches; a flag lost with its cache falls back to is_step.
+		flagged = set(raw.get("preamble_steps") or [])
+		preambles = [step for step in raw["steps"] if step in flagged]
+		sentences = [step for step in raw["steps"] if step not in flagged and is_step(step)]
+		stripped_of_steps = strip_steps(strip_preambles(joined, preambles), sentences)
+		answer, _, _ = egress_rules.redact_final_with_media(stripped_of_steps, run_id=raw["run_id"])
+		reshow = None
+		if raw["steps"] and answer and answer != lane.last_shown:
+			# The saved reply keeps text the live view had hidden (e.g. a short
+			# answer written before a card tool call): show it again before the
+			# terminal lands. The mirror stays the redacted full raw stream,
+			# same as every other delta's "text" field. Compared against
+			# lane.last_shown (PUMP-thread-owned, see ``_Lane.last_shown``), not
+			# a reader-thread snapshot: an agent-yield continuation re-adopts
+			# this SAME lane onto a fresh run for a second terminal, and if that
+			# continuation streams no deltas of its own before settling, a
+			# reader-side snapshot would still hold what was shown BEFORE the
+			# FIRST terminal's own reshow ran.
+			reshow = {
+				"seq": raw["reshow_seq"],
+				"text": egress_rules.redact(raw["stream_text"]),
+				"delta": "",
+				"shown": answer,
+			}
+		term_payload = {"text": answer}
+		if rels:  # fetchable media -> seed downstream (only set when present)
+			term_payload["media_rels"] = rels
+		if marked:  # any MEDIA: line stripped -> force the content overwrite
+			term_payload["marker_stripped"] = True
+		if raw["media_urls"]:  # gateway-attached image/video/audio/document content blocks
+			term_payload["media_urls"] = raw["media_urls"]
+		if raw["is_continuation"]:
+			# Marks this as the yield's continuation outcome so the caller's
+			# post-settle rich-output step (finalize._effect_rich_outputs) knows
+			# it may need to harvest the actual media from separate later
+			# transcript messages when neither media_rels nor media_urls landed
+			# here.
+			term_payload["yield_continuation"] = True
+		return "relay:final", term_payload, reshow
+
+	def _offer(self, lane: _Lane, ev: _LaneEvent) -> None:
+		status = lane.offer(ev)
+		if status == "ok":
+			self._wake.set()
+		elif status == "dropped":
+			self._bump("deltas_dropped")
+			self._wake.set()
+		elif status == "quarantine":
+			# PRECIOUS overflow (D5 §4 overflow-on-precious). Hand off to the pump
+			# thread — the reader never invokes a lane callback.
+			self._defer_quarantine(lane, "precious_overflow")
+		# "closed": lane no longer active; drop silently (its frames are stale).
+
+	# -- send path (serialized by the session lock) ------------------------- #
+
+	def issue_rpc(self, method: str, params: dict, *, timeout_s: float = DEFAULT_RPC_TIMEOUT_S) -> PendingRpc:
+		"""Issue one RPC and return its bounded cancellable future. Registers the
+		future in the pending-RPC map BEFORE the frame is written (so a fast
+		response can never arrive before the map knows about it), then writes it
+		through the session's IO gate. The reader resolves the future when the
+		response arrives; the caller awaits ``future.result(timeout)``.
+
+		Raises ``SendNotStarted`` (no byte of the frame went out) or, once the write
+		started, ``SendUncertain`` (code ``ack-timeout``) or the original non-socket
+		exception. Those two poison the transport, and so does a ``SendNotStarted``
+		with reason ``local`` (a socket error before the first byte: the socket may be
+		broken), so ``is_closed()`` is already true when this raises. A closed, busy or
+		deadline refusal leaves the transport as it was. The pending entry is removed
+		on every failure."""
+		if self.is_closed() or self._stopping.is_set():
+			self._bump("writes_refused")
+			raise SendNotStarted(f"{method} was not sent: the relay connection is closed")
+		write_s = IO_WRITE_TIMEOUT_S
+		deadline = self._write_deadline
+		if deadline is not None and time.monotonic() + write_s > deadline:
+			self._bump("writes_refused")
+			raise SendNotStarted(
+				f"{method} was not sent: no time left in this delivery window", reason="deadline"
+			)
+		payload, req_id = _build_request_frame(method, params)
+		fut = PendingRpc(method, req_id, timeout_s)
+		fut._on_settle = self._drop_pending
+		with self._pending_lock:
+			self._pending[req_id] = fut
+		try:
+			self._write(method, payload, write_s, deadline)
+		except SendNotStarted as exc:
+			self._drop_pending(req_id)
+			self._bump("writes_refused")
+			if exc.reason == "local":
+				self._poison(method, exc)
+			raise
+		except BaseException as exc:
+			self._drop_pending(req_id)
+			self._poison(method, exc)
+			raise
+		return fut
+
+	def _poison(self, method: str, exc: BaseException) -> None:
+		"""No later write starts on this transport. Called with no lock held; warns
+		once per mux, naming only the method and the exception class."""
+		first = not self._poisoned.is_set()
+		self._poisoned.set()
+		self._wake.set()
+		self._bump("writes_poisoned")
+		if first:
+			try:
+				_logger.warning("relay_mux: transport poisoned by %s (%s)", method, type(exc).__name__)
+			except Exception:
+				pass  # diagnostics only: never replace the caller's outcome
+
+	def _write(self, method: str, payload: str, write_s: float, deadline: float | None) -> None:
+		session = self._session
+		if isinstance(session, AgentSession):
+			session._write_frame(
+				payload, wait_s=IO_GATE_WAIT_S, write_s=write_s, not_after=deadline, method=method
+			)
+			return
+		# Transport doubles (tests): the serialized send they model. Whatever its
+		# failure, the write had started, so it is ambiguous.
+		try:
+			with session._lock:
+				session._ws.send(payload)
+		except Exception as exc:
+			raise SendUncertain(f"{method} send failed: {exc}") from exc
+
+	def send_chat(
+		self,
+		session_key: str,
+		message: str,
+		run_id: str,
+		handler: LaneHandler,
+		*,
+		timeout_s: float = DEFAULT_RPC_TIMEOUT_S,
+		start_seq: int = 0,
+		thinking: str | None = None,
+		deliver: bool = False,
+		attachments: list[dict] | None = None,
+		verified_session_id: str | None = None,
+	) -> PendingRpc:
+		"""FRESH-send fast path with early-frame routing (OAR-15). PRE-REGISTERS
+		the run map under ``run_id == idempotencyKey`` at ISSUANCE (before the
+		ack), so any frame arriving in the issuance→ack window routes to its lane
+		immediately. Returns the ack future.
+
+		Retry-attach (an ack of ``status:"in_flight"`` returning an EXISTING
+		run's id) is NOT handled here: the caller inspects the ack and calls
+		``rekey_run(run_id, ack_run_id)`` when the returned id differs."""
+		if ":dashboard:collab:" in session_key and not verified_session_id:
+			raise AgentUnreachableError("Shared sessions require a verified physical session before sending.")
+		self.register_run(run_id, handler, session_key=session_key, start_seq=start_seq)
+		params: dict = {
+			"sessionKey": session_key,
+			"message": message,
+			"idempotencyKey": run_id,
+			"deliver": deliver,
+		}
+		if verified_session_id:
+			params.update(sessionId=verified_session_id, expectedPermissionMode="read-only")
+		if thinking:
+			params["thinking"] = thinking
+		if attachments:
+			params["attachments"] = attachments
+		try:
+			return self.issue_rpc("chat.send", params, timeout_s=timeout_s)
+		except BaseException:
+			# No lane may outlive a send that failed at issuance (a ghost lane would
+			# swallow a later run's frames). A poisoned transport delivers nothing more.
+			self.unregister_run(run_id)
+			raise
+
+	def set_session_model(
+		self, session_key: str, model_ref: str | None, *, timeout_s: float = DEFAULT_RPC_TIMEOUT_S
+	) -> PendingRpc:
+		"""``sessions.patch`` — per-conversation model override, issued mid-stream
+		without stealing any lane's frames.
+
+		``model_ref=None`` resets the session to the agent default (clearing the
+		override, which is what keeps the fallback chain live). Same contract as
+		``AgentSession.set_session_model`` — see its docstring."""
+		return self.issue_rpc("sessions.patch", {"key": session_key, "model": model_ref}, timeout_s=timeout_s)
+
+	def abort(
+		self, session_key: str, run_id: str | None = None, *, timeout_s: float = DEFAULT_RPC_TIMEOUT_S
+	) -> PendingRpc:
+		"""``chat.abort`` — the mux ISSUES the abort RPC when the pump asks, but
+		abort authority does not live in the reader loop (D5 non-goal: the direct
+		out-of-band abort route stays primary)."""
+		params: dict = {"sessionKey": session_key}
+		if run_id:
+			params["runId"] = run_id
+		return self.issue_rpc("chat.abort", params, timeout_s=timeout_s)
+
+	# -- run map management ------------------------------------------------- #
+
+	def register_run(
+		self,
+		run_id: str,
+		handler: LaneHandler,
+		*,
+		session_key: str = "",
+		start_seq: int = 0,
+		is_readopt: bool = False,
+		steps: list[str] | None = None,
+		preamble_steps: list[str] | None = None,
+	) -> _Lane | None:
+		"""Create + install a lane in the run map. Used both for FRESH sends
+		(pre-registration under ``run_id``, OAR-15) and for reconnect rebuild /
+		retry-attach (the pump feeds the lane spec). When the poison-rate breaker
+		is OPEN and this is a RE-ADOPT, the mux REFUSES (returns ``None``) rather
+		than loop the run through the recovery budget again (OAR-7). ``steps``
+		re-seeds the step text a re-adopted run already recorded before the hop,
+		and ``preamble_steps`` which of them the runtime flagged (their raw text),
+		so the saved reply still strips those after the hop.
+		R6 segment tails are NOT re-seeded here - see ``_Lane.segment_tails``'s
+		known-limit comment - so a segment boundary recorded before a hop is
+		not joined; a fresh lane always starts with an empty ``segment_tails``."""
+		if is_readopt and self.is_breaker_open():
+			return None
+		lane = _Lane(run_id, handler, session_key=session_key, start_seq=start_seq)
+		lane.steps = list(steps or [])
+		lane.preamble_steps = {step for step in preamble_steps or [] if step in lane.steps}
+		with self._map_lock:
+			self._runs[run_id] = lane
+		return lane
+
+	def rekey_run(self, from_key: str, to_key: str) -> bool:
+		"""Retry-attach re-key (§6 / R-20): move a lane from its fresh
+		``idempotencyKey`` to the EXISTING gateway run id returned by an
+		``in_flight`` ack. Returns True on success."""
+		if from_key == to_key:
+			return True
+		with self._map_lock:
+			lane = self._runs.pop(from_key, None)
+			if lane is None:
+				return False
+			lane.run_id = to_key
+			self._runs[to_key] = lane
+		return True
+
+	def unregister_run(self, run_id: str) -> None:
+		with self._map_lock:
+			self._runs.pop(run_id, None)
+
+	def await_continuation(self, run_id: str) -> bool:
+		"""Park a just-terminaled lane awaiting an agent-yield continuation
+		(pump ``on_terminal``, image/video/music tools' background-detach abort):
+		keep it registered under ``run_id`` (the now-dead gateway id) and index it
+		by session_key so ``_route_event`` can adopt the follow-up run's frames
+		when they arrive under a fresh runId. Returns False if the lane is already
+		gone (e.g. a takeover already retired it) - the caller then falls back to
+		settling immediately, exactly as if no yield had been detected."""
+		with self._map_lock:
+			lane = self._runs.get(run_id)
+			if lane is None:
+				return False
+			lane.awaiting = True
+			self._awaiting[lane.session_key] = run_id
+			return True
+
+	def release_continuation(self, session_key: str) -> None:
+		"""Undo ``await_continuation`` for ``session_key`` - resolved by session
+		key, NEVER a runId (the caller cannot know it once ``_route_event`` has
+		adopted the continuation onto a fresh one; a stale runId would release
+		nothing and leak the live lane). Drops the parked lane if the
+		continuation never arrived (timeout / Stop before adoption), or the
+		ADOPTED-but-not-yet-terminaled lane if a Stop lands while the
+		continuation is already streaming. Idempotent; safe to call when nothing
+		is parked or the lane already retired via its own terminal. Admission
+		enforces one in-flight turn per conversation, so at most one lane can
+		ever be registered under a given session_key."""
+		with self._map_lock:
+			run_id = self._awaiting.pop(session_key, None)
+			if run_id is None:
+				for rid, lane in self._runs.items():
+					if lane.session_key == session_key:
+						run_id = rid
+						break
+			if run_id is not None:
+				self._runs.pop(run_id, None)
+
+	# -- application (pump-thread; the mux invokes the pump callbacks here) -- #
+
+	def dispatch(self, *, block_s: float = 0.0, max_events: int | None = None) -> int:
+		"""Drain buffered lane events and apply them via the pump-provided
+		callbacks, with integrity-class fault handling. MUST be called on the
+		pump thread (the one with the DB connection). Returns the number of
+		events applied.
+
+		``block_s`` > 0 waits up to that long for the reader to signal work before
+		draining (so a driver loop need not busy-spin). Deferred quarantine
+		notifications (from precious-overflow on the reader) are delivered here
+		too, on this thread.
+
+		CDX-13 — FAIR draining: round-robin passes over the lanes, each pass taking at
+		most ``LANE_QUANTUM`` events from a lane, capped at ``max_events`` (default
+		``DISPATCH_EVENT_BUDGET``) events overall per call. A hot lane can no longer
+		drain its whole 512-event backlog before a cold lane is serviced. Any residue
+		(budget tripped with work remaining) RE-ARMS the wake so the next dispatch
+		continues immediately — no event is stranded, just fairly deferred."""
+		budget = max_events if max_events is not None else DISPATCH_EVENT_BUDGET
+		if block_s > 0 and not self._has_work():
+			self._wake.wait(block_s)
+		self._wake.clear()
+
+		self._flush_deferred_quarantines()
+
+		with self._map_lock:
+			lanes = list(self._runs.values())
+
+		applied = 0
+		# Round-robin passes: interleave the lanes a quantum at a time until nothing
+		# remains or the per-call budget is spent (fairness on the single reader).
+		while applied < budget:
+			progressed = False
+			for lane in lanes:
+				if applied >= budget:
+					break
+				take = min(LANE_QUANTUM, budget - applied)
+				drained = lane.drain(take)
+				if not drained:
+					continue
+				progressed = True
+				for ev in drained:
+					self._apply(lane, ev)
+					applied += 1
+					if applied >= budget:
+						break
+			if not progressed:
+				break
+
+		# CDX-13: if the budget was spent with buffered events still pending, re-arm the
+		# wake so the driver's next dispatch drains the residue at once (never stalls).
+		if applied >= budget and self._has_work():
+			self._wake.set()
+		return applied
+
+	def _apply(self, lane: _Lane, ev: _LaneEvent) -> None:
+		"""Apply one drained lane event via its pump-provided callback. This runs
+		on the PUMP thread (``dispatch()`` guarantees it), which is also where
+		``egress_rules`` (needs ``frappe.db``) is applied to every user-facing
+		text field the reader queued RAW: the reader thread has no site DB (this
+		file's HARD INVARIANTS), so it can only classify and buffer - never
+		redact."""
+		h = lane.handler
+		try:
+			if ev.kind == "delta":
+				if h.on_delta is not None:
+					text = egress_rules.redact(ev.data["text"])
+					delta = egress_rules.redact(ev.data["delta"])
+					shown = ev.data.get("shown")
+					if shown is not None:
+						shown = egress_rules.redact(shown)
+					h.on_delta(ev.event_seq, text, delta, shown)
+					# PUMP-thread-owned "what did the user last actually see"
+					# (see _Lane.last_shown) - only updated on a SUCCESSFUL
+					# delivery; a raise here is caught below as an ordinary
+					# poison delta (drop+continue) and what the user is
+					# currently shown is unaffected by it.
+					lane.last_shown = shown if shown is not None else text
+			elif ev.kind == "tool":
+				if h.on_tool is not None:
+					data = dict(ev.data)
+					if data.get("title"):
+						data["title"] = egress_rules.redact(data["title"])
+					h.on_tool({"event_seq": ev.event_seq, **data})
+			elif ev.kind == "status":
+				if h.on_status is not None:
+					h.on_status(ev.event_seq, ev.data["status"])
+			elif ev.kind == "step":
+				if h.on_step is not None:
+					# ev.data["text"] is the FULL raw step text (see
+					# _offer_step): redact it whole FIRST, then shape it with
+					# display_line (prose extraction + the 160-char
+					# truncation) - truncating before redacting could cut a
+					# forbidden word in half and leak the surviving fragment.
+					# "raw" (unlike "text") stays UN-redacted: it reseeds
+					# lane.steps on a reconnect
+					# (pump._append_run_step/_read_run_steps), and
+					# lane.stream_text - which remove_steps() matches it
+					# against - is raw too, throughout this lane's life.
+					# Redacting the "raw" copy would break that substring
+					# match on the very next hop.
+					line = display_line(egress_rules.redact(ev.data["text"]))
+					if line:
+						h.on_step(ev.event_seq, line, ev.data.get("raw"), bool(ev.data.get("preamble")))
+			elif ev.kind == "terminal":
+				term_kind, term_payload, reshow = self._finalize_terminal(lane, ev)
+				if reshow is not None and h.on_delta is not None:
+					# The reshow is a LOSSY delta in spirit (it only re-shows text a
+					# later delta would otherwise supersede): isolate its own raise
+					# so a transient on_delta fault (e.g. a flush hitting a DB
+					# blip) drops+continues, same as any other poison delta, and
+					# never quarantines the terminal that follows it.
+					try:
+						h.on_delta(reshow["seq"], reshow["text"], reshow["delta"], reshow["shown"])
+						# See _Lane.last_shown: this IS an on_delta delivery
+						# (just a synthetic pre-terminal one), so it updates
+						# the same PUMP-owned "last shown" record a plain
+						# delta would.
+						lane.last_shown = reshow["shown"]
+					except Exception:
+						lane.poison_count += 1
+						self._bump("deltas_dropped")
+						_logger.debug(
+							"relay_mux: poison reshow delta on run=%s dropped, terminal continues",
+							lane.run_id,
+							exc_info=True,
+						)
+				if h.on_terminal is not None:
+					h.on_terminal(term_kind, term_payload)
+				# The terminal is normally the last frame of a run — retire the
+				# lane so subsequent frames for this id count as stray. EXCEPT
+				# when on_terminal just parked it awaiting an agent-yield
+				# continuation (``await_continuation``): keep it registered so
+				# the follow-up run's frames can be adopted (``_route_event``).
+				if not lane.awaiting:
+					self._retire_lane(lane)
+		except Exception:
+			lane.poison_count += 1
+			if ev.cls == LOSSY:
+				# Poison DELTA (OAR-7): DROP the frame, count it, CONTINUE the
+				# SAME lane. The next cumulative mirror supersedes it; a lossy
+				# fault NEVER parks the turn.
+				self._bump("deltas_dropped")
+				_logger.debug(
+					"relay_mux: poison %s on run=%s seq=%s dropped+continued",
+					ev.kind,
+					lane.run_id,
+					ev.event_seq,
+					exc_info=True,
+				)
+			else:
+				# Poison PRECIOUS (terminal/tool): QUARANTINE this ONE lane; its
+				# neighbours keep streaming on the same socket (D5 §5). Log the
+				# cause: the turn only finishes through snapshot recovery a hop
+				# later, and without the traceback that stall is undiagnosable.
+				_logger.warning(
+					"relay_mux: precious %s on run=%s seq=%s raised, quarantining",
+					ev.kind,
+					lane.run_id,
+					ev.event_seq,
+					exc_info=True,
+				)
+				self._quarantine(lane, "precious_fault")
+
+	# -- quarantine + circuit breaker (OAR-7) ------------------------------- #
+
+	def _defer_quarantine(self, lane: _Lane, reason: str) -> None:
+		"""Reader-side: mark the lane quarantined and hand the callback to the
+		pump thread (the reader never invokes a lane callback)."""
+		with self._map_lock:
+			self._runs.pop(lane.run_id, None)
+			self._quarantine_pending.append((lane, reason))
+		self._wake.set()
+
+	def _flush_deferred_quarantines(self) -> None:
+		with self._map_lock:
+			pending = self._quarantine_pending
+			self._quarantine_pending = []
+		for lane, reason in pending:
+			self._notify_quarantine(lane, reason)
+
+	def _quarantine(self, lane: _Lane, reason: str) -> None:
+		"""Pump-side: fence one lane off, remove it from the run map, fire its
+		``on_quarantine`` callback, and record it against the poison-rate
+		breaker. Called inline for an apply fault; deferred-list for a
+		reader-side overflow."""
+		with lane.lock:
+			if lane.state in ("terminal", "closed"):
+				return
+			lane.state = "quarantined"
+		with self._map_lock:
+			self._runs.pop(lane.run_id, None)
+		self._notify_quarantine(lane, reason)
+
+	def _notify_quarantine(self, lane: _Lane, reason: str) -> None:
+		self._bump("lanes_quarantined")
+		self._record_quarantine()
+		if lane.handler.on_quarantine is not None:
+			try:
+				lane.handler.on_quarantine(reason)
+			except Exception:
+				_logger.debug("relay_mux: on_quarantine callback raised", exc_info=True)
+
+	def _record_quarantine(self) -> None:
+		fire = False
+		count = 0
+		with self._breaker_lock:
+			now = time.monotonic()
+			self._quarantine_times.append(now)
+			while self._quarantine_times and now - self._quarantine_times[0] > self._breaker_window_s:
+				self._quarantine_times.popleft()
+			count = len(self._quarantine_times)
+			if not self._breaker_open and count > self._breaker_threshold:
+				self._breaker_open = True
+				fire = True
+		if fire and self._on_breaker is not None:
+			try:
+				self._on_breaker(self.relay_target_id, count)
+			except Exception:
+				_logger.debug("relay_mux: on_breaker callback raised", exc_info=True)
+
+	def _retire_lane(self, lane: _Lane) -> None:
+		with lane.lock:
+			lane.state = "terminal"
+		with self._map_lock:
+			self._runs.pop(lane.run_id, None)
+
+	# -- Closing (transport loss, OAR-10) ----------------------------------- #
+
+	def _begin_closing(self, exc: BaseException) -> None:
+		"""Socket died. BEFORE anything reconnects (the pump's job, not the
+		mux's): fail ALL pending-RPC futures with the transport sentinel — an
+		orphaned ``chat.send`` ack would otherwise dead-wait its full timeout,
+		leaving the ``dispatching`` turn stuck; failing immediately lets each
+		awaiter resolve and the turn park deterministically (OAR-10). Then notify
+		every active lane via ``on_closing`` so the pump re-attaches from durable
+		state on the next hop. Does NOT reconnect."""
+		if self._closed.is_set():
+			return
+		detail = str(exc)
+		sentinel = AgentUnreachableError(f"relay transport lost: {detail}", code="ack-timeout")
+		# 1. fail ALL pending RPC futures (immediately, no dead-wait).
+		with self._pending_lock:
+			futs = list(self._pending.values())
+			self._pending.clear()
+		for fut in futs:
+			fut.set_exception(sentinel)
+		with self._counter_lock:
+			self._rpc_failed_on_close += len(futs)
+		# 2. notify every active lane; the run map holds no truth the DB lacks.
+		with self._map_lock:
+			lanes = list(self._runs.values())
+			self._runs.clear()
+			self._quarantine_pending = []
+		for lane in lanes:
+			if lane.handler.on_closing is not None:
+				try:
+					lane.handler.on_closing("transport")
+				except Exception:
+					_logger.debug("relay_mux: on_closing callback raised", exc_info=True)
+		self._closed.set()
+		self._wake.set()
+		# On the reader thread: abort only (no graceful CLOSE, no descriptor close
+		# under a possibly active writer); the owner's stop() closes the socket.
+		try:
+			if isinstance(self._session, AgentSession):
+				self._session.abort_transport()
+			else:
+				self._session.close()
+		except Exception:
+			pass
+
+	def _cancel_all_pending(self) -> None:
+		with self._pending_lock:
+			futs = list(self._pending.values())
+			self._pending.clear()
+		for fut in futs:
+			fut.cancel()
+
+	def _drop_pending(self, req_id: str) -> None:
+		with self._pending_lock:
+			self._pending.pop(req_id, None)
+
+	# -- telemetry ---------------------------------------------------------- #
+
+	def _bump(self, name: str, n: int = 1) -> None:
+		with self._counter_lock:
+			setattr(self, f"_{name}", getattr(self, f"_{name}") + n)
+
+	def _has_work(self) -> bool:
+		with self._map_lock:
+			if self._quarantine_pending:
+				return True
+			for lane in self._runs.values():
+				if lane.queue:
+					return True
+		return False
+
+	def stats(self) -> dict:
+		"""Telemetry snapshot (Amendment I). ``stray_frames`` settles the demoted
+		"N workers discard everyone else's frames" question; ``deltas_dropped``
+		and ``lanes_quarantined`` expose the poison surface. ``reader_errors``
+		(the #1449-regression counter) should stay 0 in healthy operation -
+		it counts a routing bug on a KNOWN lane, not routine wire noise; the
+		pump logs it in its per-hop telemetry line so a regression here is
+		visible without a live probe."""
+		with self._counter_lock:
+			return {
+				"stray_frames": self._stray_frames,
+				"deltas_dropped": self._deltas_dropped,
+				"lanes_quarantined": self._lanes_quarantined,
+				"rpc_failed_on_close": self._rpc_failed_on_close,
+				"chat_delta_ignored": self._chat_delta_ignored,
+				"reader_errors": self._reader_errors,
+				"writes_refused": self._writes_refused,
+				"writes_poisoned": self._writes_poisoned,
+				"breaker_open": self.is_breaker_open(),
+				"active_runs": len(self._runs),
+			}

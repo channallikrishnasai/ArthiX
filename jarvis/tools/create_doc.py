@@ -1,0 +1,187 @@
+"""Create a new Frappe document - one, or a whole batch - with
+permission-aware writes.
+
+Sibling of ``update_doc``. The agent uses this when the user asks for a
+new record ("create a customer Acme", "add a task for tomorrow").
+
+Two shapes (the batch overload replaced the retired ``create_docs`` tool, for
+uniformity with the other write tools):
+
+- **Single:** ``create_doc(doctype, values)`` -> the inserted doc as a dict.
+- **Batch:** ``create_doc(docs=[{"doctype","values"}, ...])`` -> a lean
+  ``{"created":[{"doctype","name"}], "notes":[...]}``, every insert in ONE
+  atomic savepoint (a single confirmation card). Order matters: put a
+  dependency before the doc that links it.
+
+Safety bounds (same shape as update_doc, adapted for create):
+
+- Calling user must have ``create`` permission on the target DocType
+  (``frappe.has_permission(doctype, ptype="create")``). Record-level
+  perms don't apply yet - no record exists.
+- System fields are refused: ``owner``, ``creation``, ``modified``,
+  ``modified_by``, ``doctype``, ``docstatus``, ``idx``, ``parent``,
+  ``parentfield``, ``parenttype``. ``name`` is **allowed** so DocTypes
+  with autoname=prompt / field-derived autoname work - Frappe's autoname
+  machinery decides whether to honour it.
+- Empty ``values`` dict is refused - agents shouldn't create blank rows.
+- The DocType's validate() and on_insert() hooks fire via ``doc.insert()``,
+  so required fields, link integrity, and business rules apply.
+"""
+
+import frappe
+
+from jarvis.exceptions import InvalidArgumentError, PermissionDeniedError
+from jarvis.tools._bulk import _MAX_BATCH, run_atomic_batch
+from jarvis.tools._delegate_write_caps import enforce_create
+from jarvis.tools._field_values import cast_numbers, check_values
+
+# `name` is intentionally NOT in this list: DocTypes that use autoname=prompt
+# (or autoname=field:<x>) need it set in `values`. Frappe's autoname handling
+# decides whether to use or ignore the supplied name.
+PROTECTED_FIELDS = frozenset(
+	{
+		"owner",
+		"creation",
+		"modified",
+		"modified_by",
+		"doctype",
+		"docstatus",
+		"idx",
+		"parent",
+		"parentfield",
+		"parenttype",
+	}
+)
+
+
+def refused_field_names(keys, protected=PROTECTED_FIELDS) -> list[str]:
+	"""The keys a write payload may not set: the protected fields, amended_from,
+	and underscore-prefixed names (_comments, _assign, ...), which are all
+	framework-managed. Shared by create_doc and update_doc."""
+	return sorted(k for k in keys if k in protected or k == "amended_from" or str(k).startswith("_"))
+
+
+def _validate_create_args(doctype: str, values: dict) -> None:
+	"""Shared guards for create-shaped payloads (create_doc + preview_doc):
+	non-empty args, no protected fields, create permission."""
+	if not doctype:
+		raise InvalidArgumentError("doctype is required")
+	if not isinstance(values, dict) or not values:
+		raise InvalidArgumentError("values must be a non-empty dict")
+
+	protected = refused_field_names(values)
+	if protected:
+		raise InvalidArgumentError(f"refusing to write protected field(s): {', '.join(protected)}")
+
+	# R5-J9: bind a DELEGATE agent's create to its declared writes[] contract BEFORE
+	# the Frappe permission check below (a no-op for non-delegate callers). An auditor
+	# is refused outright; an operator may create only a doctype in its contract. The
+	# create is structurally a draft (docstatus is a refused protected field).
+	enforce_create(doctype)
+
+	if not frappe.has_permission(doctype, ptype="create"):
+		raise PermissionDeniedError(f"no create permission on {doctype}")
+
+
+def _insert_one(
+	doctype: str, values: dict, *, ignore_mandatory: bool = False
+) -> "frappe.model.document.Document":
+	"""Build + insert ONE doc from ``values`` (guards already run). Returns the
+	inserted Document. Shared by the single and batch paths so they never drift.
+	``ignore_mandatory``: the held-write classifier's sandbox (collect mode).
+	The field type check runs first (``_field_values``): a value Frappe would store
+	as 0 or the database would refuse is rejected naming the field (R2-3)."""
+	doc = build_doc(doctype, values)
+	if ignore_mandatory:
+		doc.flags.ignore_mandatory = True
+	doc.insert()  # runs DocType validate() + on_insert hooks; sets autoname
+	return doc
+
+
+def build_doc(doctype: str, values: dict) -> "frappe.model.document.Document":
+	"""An unsaved ``doctype`` holding ``values`` as a write would set them: the field
+	type check first (a bad value raises naming the field), then numeric strings cast
+	the way Frappe stores them, then the title. Shared by every insert and dry run."""
+	values = check_values(doctype, values)
+	doc = frappe.new_doc(doctype)
+	for field, value in values.items():
+		doc.set(field, value)
+	if doctype == "Landed Cost Voucher":
+		from jarvis.tools._client_defaults import landed_cost_vendor_amounts
+
+		landed_cost_vendor_amounts(doc, values)
+	cast_numbers(doc)
+	_set_title_from_title_field(doc)
+	return doc
+
+
+def create_doc(
+	doctype: str | None = None,
+	values: dict | None = None,
+	docs: list | None = None,
+	notes: list | None = None,
+) -> dict:
+	"""Insert a new document - or a whole batch when ``docs`` is given.
+
+	Single (``doctype`` + ``values``): returns the inserted document as a dict
+	(matching ``get_doc``'s shape), including the autogenerated ``name``.
+	Batch (``docs``): returns ``{"created":[{"doctype","name"}], "notes":[...]}``.
+
+	Raises:
+	  - InvalidArgumentError on empty args, empty values, attempts to write
+	    protected fields (per item, for a batch)
+	  - PermissionDeniedError when the calling user lacks create on the DocType
+	  - frappe.ValidationError when a DocType's own validate() rejects
+	"""
+	if docs is not None:
+		return _create_batch(docs, notes)
+
+	_validate_create_args(doctype, values)
+	doc = _insert_one(doctype, values)
+	doc.apply_fieldlevel_read_permissions()
+	return doc.as_dict()
+
+
+def _create_batch(docs: list, notes: list | None = None) -> dict:
+	"""Insert every ``{"doctype","values"}`` atomically (the retired create_docs
+	tool's path). All inserts run in one savepoint (``run_atomic_batch``): if any
+	fails, the whole batch rolls back and nothing is committed. A doc may link
+	to one created earlier in the same batch (same transaction)."""
+	if not isinstance(docs, list) or not docs:
+		raise InvalidArgumentError("docs must be a non-empty list of {doctype, values}")
+	if len(docs) > _MAX_BATCH:
+		raise InvalidArgumentError(f"too many docs in one batch (max {_MAX_BATCH})")
+	for i, item in enumerate(docs):
+		if not isinstance(item, dict):
+			raise InvalidArgumentError(f"docs[{i}] must be a dict with doctype + values")
+		values = item.get("values")
+		# Reuse the single-create guards: non-empty values, no protected
+		# fields, per-doctype create permission - same errors a single create
+		# would raise, up front so a bad item bounces before any insert / card.
+		_validate_create_args(item.get("doctype"), values if isinstance(values, dict) else {})
+
+	def _do(item: dict) -> dict:
+		doc = _insert_one(item["doctype"], item["values"])
+		return {"doctype": doc.doctype, "name": doc.name}
+
+	created = run_atomic_batch(docs, _do, label=lambda d: d.get("doctype"))
+	return {"created": created, "notes": list(notes) if isinstance(notes, list) else []}
+
+
+def _set_title_from_title_field(doc) -> None:
+	"""Materialize an empty ``title`` from the doctype's ``title_field``.
+
+	Desk forms historically filled ``title`` via a templated default (e.g.
+	``{supplier_name}`` on invoices); newer schemas dropped the template and
+	point ``title_field`` at the source field instead, leaving the stored
+	``title`` column blank on API-created records - visibly inconsistent
+	next to older data and any print/report that reads ``title``. Filling
+	it with the ``title_field`` value just persists what Frappe would
+	display anyway; explicit caller values always win."""
+	try:
+		meta = doc.meta
+		tf = meta.get("title_field")
+		if tf and tf != "title" and meta.has_field("title") and not doc.get("title") and doc.get(tf):
+			doc.set("title", doc.get(tf))
+	except Exception:
+		pass  # cosmetic best-effort; never block the insert

@@ -1,0 +1,177 @@
+import contextlib
+import json
+import re
+
+# The shared builder that turns an export into a private File + download-card
+# envelope. Used by export_query and report_pdf; export_excel / export_document /
+# download_pdf still roll their own save (a follow-up migration - see the export
+# DEFERRED backlog). The chat surface renders the card automatically from this
+# envelope via api._maybe_attach_artifact (keyed on the filename extension ->
+# canvas._EXT_TYPE).
+
+
+def _safe_base(title: str) -> str:
+	"""File-doctype-safe base name from a caller title.
+
+	A title can carry markup, slashes and other characters Frappe's File
+	sanitiser rejects or rewrites - notably it re-introduces a ``/`` from a
+	closing HTML tag (``</b>``), which then raises ``ValidationError: File name
+	cannot have /`` deep inside ``save_file`` (a bug already hit for a sibling
+	tool). Keep only filename-safe characters, cap the length, never return
+	empty. The single filename sanitiser for every export tool."""
+	base = re.sub(r"[^A-Za-z0-9._-]+", "-", title or "").strip("-.")
+	return base[:80] or "export"
+
+
+def save_export_file(
+	filename: str,
+	content: bytes,
+	title: str,
+	mime_type: str,
+	dt: str | None = None,
+	dn: str | None = None,
+) -> dict:
+	"""Persist ``content`` as a PRIVATE File and return the download-card envelope
+	``{file_url, filename, title, mime_type, size_bytes, name}``.
+
+	The base name comes from ``title`` (sanitised); the extension comes from
+	``filename`` (it drives the chat render type). ``dt``/``dn`` default to None
+	-> an UNATTACHED private File, whose ``has_permission`` falls through to
+	owner-only, so an export is readable only by the user who ran it. Pass
+	``dt``/``dn`` only to attach to a record the same audience may already read
+	(never for content rendered with the caller's own field-level access)."""
+	import frappe
+	from frappe.exceptions import ValidationError
+
+	from jarvis.exceptions import InvalidArgumentError
+
+	ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+	fname = f"{_safe_base(title)}.{ext}"
+	try:
+		fdoc = _insert_own_file(fname, content, dt, dn)
+	except ValidationError as e:
+		# save_file raises ValidationError for a File-save constraint - notably
+		# MaxFileSizeReachedError when the bytes exceed the site's max_file_size,
+		# which a large but under-row-ceiling export can hit. A big export is
+		# legitimate, so translate to a clean, self-contained, actionable message
+		# (the raw driver text can carry markup + a second admin-only remedy that
+		# reads as a run-on); the original rides in the traceback via `from e`.
+		raise InvalidArgumentError(
+			"The export is too large to store as a file (it exceeds this site's maximum "
+			"file size). Narrow the filter or export fewer fields."
+		) from e
+	return {
+		"file_url": fdoc.file_url,
+		"filename": fdoc.file_name,
+		"title": title or "Export",
+		"mime_type": mime_type,
+		"size_bytes": int(fdoc.file_size or len(content)),
+		"name": fdoc.name,
+	}
+
+
+def _insert_own_file(fname: str, content: bytes, dt: str | None, dn: str | None):
+	"""A private File of the caller's own, even when another user already holds a
+	File with the very same bytes.
+
+	Frappe de-duplicates Files by content hash: ``File.save_file`` reuses the
+	existing blob's URL and ``validate_duplicate_entry`` then refuses when that File
+	is private and owned by someone else ("You do not have permission to access
+	this file"). An export is deterministic bytes for deterministic data (a CSV of
+	the same report, the same filters), so two users exporting the same thing hit
+	that refusal, and the second one got no file (#2102 e2e). Writing our own blob
+	first, with the existing-file check off, gives this File its own URL; the
+	duplicate-entry check is then skipped because sharing nothing with the other
+	File is the point. The size limit (``MaxFileSizeReachedError``) still applies."""
+	import frappe
+
+	fdoc = frappe.new_doc("File")
+	fdoc.update(
+		{
+			"file_name": fname,
+			"is_private": 1,
+			"attached_to_doctype": dt,
+			"attached_to_name": dn,
+			"content": content,
+		}
+	)
+	fdoc.save_file(content=content, ignore_existing_file_check=True)
+	fdoc.flags.ignore_duplicate_entry_error = True
+	fdoc.insert()
+	return fdoc
+
+
+# --- render-inputs sidecar (per-document template override) -------------------
+# A generated rich document can be re-rendered in another predefined template
+# (jarvis.pdf_templates.rerender_document). That needs the ORIGINAL render inputs,
+# which the PDF File does not carry. We persist them once, at generation, as a
+# private JSON File ATTACHED to the PDF File - so it shares the PDF's owner-only
+# ACL and is swept when the PDF is deleted - and reload them on re-render.
+
+_SIDECAR_SUFFIX = ".render.json"
+# Frappe appends a random hash to the STEM of a private File's name (so its
+# file_url is unguessable): ``x.render.json`` is stored as ``x.render<hash>.json``.
+# So match the ``.render`` marker and ``.json`` extension with the hash allowed to
+# fall between them - this glob matches both the hashed and un-hashed forms.
+_SIDECAR_GLOB = "%.render%.json"
+# Hard ceiling on the stored inputs. ``content`` is already bounded by
+# export_document's own char cap; this only guards a pathological payload from
+# persisting an unbounded second File. A payload over this simply gets no sidecar
+# (re-render is then unavailable for that document - acceptable, not an error).
+_MAX_SIDECAR_BYTES = 2_000_000
+
+
+def save_render_sidecar(source_name: str | None, payload: dict) -> str | None:
+	"""Persist ``payload`` (the render inputs) as a PRIVATE JSON File attached to
+	the generated File ``source_name``, returning the sidecar File name.
+
+	Best-effort: returns ``None`` (never raises) if the sidecar cannot be stored -
+	a sidecar failure must never fail the export it describes. The sidecar inherits
+	the source File's owner-only ACL by being attached to it."""
+	if not source_name:
+		return None
+	try:
+		from frappe.utils.file_manager import save_file
+
+		blob = json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8")
+		if len(blob) > _MAX_SIDECAR_BYTES:
+			return None
+		base = _safe_base(payload.get("title") or "document")
+		fdoc = save_file(f"{base}{_SIDECAR_SUFFIX}", blob, "File", source_name, is_private=1)
+		return fdoc.name
+	except Exception:
+		import frappe
+
+		with contextlib.suppress(Exception):
+			# Plain traceback only - NOT with_context, whose local-variable dump would
+			# leak the document content into the operator-readable Error Log.
+			frappe.log_error(
+				title="jarvis.export_document: render sidecar not stored",
+				message=frappe.get_traceback(),
+			)
+		return None
+
+
+def load_render_sidecar(source_name: str) -> dict | None:
+	"""Load and parse the render-inputs sidecar attached to File ``source_name``,
+	or ``None`` if there is none. Reads under the caller's permissions; the caller
+	is responsible for verifying it owns/may read ``source_name`` first."""
+	import frappe
+
+	names = frappe.get_all(
+		"File",
+		filters={
+			"attached_to_doctype": "File",
+			"attached_to_name": source_name,
+			"file_name": ["like", _SIDECAR_GLOB],
+		},
+		pluck="name",
+		order_by="creation desc",
+		limit=1,
+	)
+	if not names:
+		return None
+	content = frappe.get_doc("File", names[0]).get_content()
+	if isinstance(content, bytes):
+		content = content.decode("utf-8")
+	return json.loads(content)

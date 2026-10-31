@@ -1,0 +1,1186 @@
+<script setup>
+import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import BrandMark from "../components/BrandMark.vue";
+import { holdActive } from "../maintenanceGate";
+import { agentName } from "@/branding";
+import { useRouter } from "vue-router";
+import * as api from "../api";
+import { store } from "../store";
+import { EFFORT, effortOffered, sendThinking } from "../lib/effort";
+import { prefs, setPrefs } from "../lib/prefs";
+import { feed } from "../lib/notifications";
+import { DEFAULT_STARTERS, normalizeStarters, starterTint } from "../lib/starters";
+import { pickStarterPrompt } from "../lib/fillComposer";
+import { enterSends } from "../lib/composerEnter";
+import Sheet from "../components/Sheet.vue";
+import AutoModeToggle from "../components/AutoModeToggle.vue";
+import { autoModeView } from "../lib/autoMode";
+import { recoveryState, sendRecovery } from "../sendRecoveryStore";
+import { observeDelivery, deliveryFailureCopy } from "@shared/lib/sendDelivery.js";
+
+// New chat: the hero screen, not an empty thread with a chat bar bolted to the
+// bottom. Brand mark, a greeting that knows the time of day and who you are, and
+// one card that holds the whole composer — attachments, model, mic, send.
+const VoiceSheet = defineAsyncComponent(() => import("../components/VoiceSheet.vue"));
+
+const router = useRouter();
+
+const editing = recoveryState.requests.find(
+	(r) => r.id === recoveryState.editingNewRequest && r.state === "rejected"
+);
+const restored = editing || recoveryState.heroDraft;
+const selectedModel = ref(restored?.model ?? prefs.defaultModel ?? "");
+const selectedEffort = ref(
+	restored?.effort ||
+		EFFORT.find((e) => e.thinking === restored?.thinking)?.value ||
+		prefs.effort
+);
+const input = ref(restored?.text || "");
+const busy = ref(false);
+const error = ref("");
+const attachments = ref(
+	(restored?.attachments || []).map((a, i) => {
+		a.key ||= `restored-${i}`;
+		return a;
+	})
+);
+const settings = ref(null);
+const starters = ref(DEFAULT_STARTERS);
+const modelSheet = ref(false);
+const voiceOpen = ref(false);
+// Auto mode (#581): /c/new has no conversation row until the first send, so the
+// toggle is local state. `armed` is pre-set from the user's default; the warning
+// sheet shows only until they have acknowledged it once.
+const autoArmed = ref(!!restored?.autoMode);
+// Not acknowledged until the server says so: an unloaded or failed settings read
+// asks (one extra confirm at worst), never skips the "not recommended" warning.
+const autoAcked = ref(false);
+const autoSheet = ref(false);
+const autoSaving = ref(false);
+const autoView = computed(() =>
+	autoModeView({ messageCount: 0, convAutoMode: 0, armed: autoArmed.value })
+);
+const inputEl = ref(null);
+const fileEl = ref(null);
+
+// Morning / afternoon / evening, by the clock on THIS device — the phone's own
+// timezone is the one the user is standing in.
+const greeting = computed(() => {
+	const h = new Date().getHours();
+	const part = h < 12 ? "Good morning" : h < 17 ? "Good afternoon" : "Good evening";
+	const first = String(window.frappe_full_name || "")
+		.trim()
+		.split(/\s+/)[0];
+	return first ? `${part}, ${first}.` : `${part}.`;
+});
+
+// Same derivation the desktop uses: the configured pool if there is one, else
+// the provider's subscription allowlist. Deduped — a pool holds one row per
+// account, not per model.
+const models = computed(() => {
+	const s = settings.value;
+	if (!s) return [];
+	const pool = s.pool_models || [];
+	if (pool.length) {
+		const seen = new Set();
+		const out = [];
+		for (const r of pool) {
+			if (!r.model || seen.has(r.model)) continue;
+			seen.add(r.model);
+			out.push(r.model);
+		}
+		return out;
+	}
+	return s.subscription_models?.[s.llm_provider] || [];
+});
+
+const currentModel = computed(() => selectedModel.value || settings.value?.llm_model || "");
+const micEnabled = computed(() => !!settings.value?.stt_enabled);
+const effortOn = computed(() => effortOffered(settings.value));
+const hasDraft = computed(
+	() => input.value.trim().length > 0 || attachments.value.some((a) => a.file_url)
+);
+const uploading = computed(() => attachments.value.some((a) => a.uploading || !a.file_url));
+
+function modelDesc(name) {
+	const n = String(name).toLowerCase();
+	if (n.includes("opus") || n.includes("5.5"))
+		return "Most capable, for complex multi-step work";
+	if (n.includes("sonnet")) return "Balanced speed and intelligence";
+	if (n.includes("haiku") || n.includes("mini") || n.includes("flash"))
+		return "Fastest, for quick everyday tasks";
+	return "Available on your plan";
+}
+
+function autoGrow() {
+	const el = inputEl.value;
+	if (!el) return;
+	el.style.height = "auto";
+	el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
+}
+
+// Tapping a starter FILLS the composer and focuses it - it never sends. The
+// user reviews (and can edit) before pressing send, which matters most for the
+// action-flavoured prompts.
+function useStarter(card) {
+	error.value = ""; // clear any stale send-failure banner before a fresh start
+	input.value = pickStarterPrompt(card);
+	nextTick(() => {
+		autoGrow();
+		inputEl.value?.focus();
+	});
+}
+
+watch(
+	() => recoveryState.requests.map((r) => `${r.id}:${r.state}`).join("|"),
+	() => {
+		for (const request of recoveryState.requests)
+			if (["accepted", "confirmed"].includes(request.state)) request.needsAdoption = false;
+	},
+	{ immediate: true }
+);
+
+const pendingNewChat = computed(() => recoveryState.requests.some((r) => !r.conversation));
+
+function draftSnapshot() {
+	return {
+		text: input.value,
+		attachments: [...attachments.value],
+		model: selectedModel.value,
+		effort: selectedEffort.value,
+		thinking: sendThinking(settings.value, selectedEffort.value),
+		autoMode: autoView.value.on,
+		autoTouched,
+	};
+}
+let submitted = false;
+function preserveDraft() {
+	// A fast refusal can settle before navigation unmounts this cleared composer.
+	if (submitted && !input.value && !attachments.value.length) return;
+	const draft = draftSnapshot();
+	if (editing?.state === "rejected") Object.assign(editing, draft);
+	else if (!editing)
+		recoveryState.heroDraft =
+			draft.text.trim() || draft.attachments.length || draft.autoTouched ? draft : null;
+}
+function reviewPending() {
+	preserveDraft();
+	router.push("/send-recovery");
+}
+async function send(text = input.value) {
+	// Dictation is draft content even when submission is unavailable.
+	if (typeof text === "string" && text !== input.value)
+		input.value = [input.value, text].filter(Boolean).join("\n");
+	if (pendingNewChat.value && !editing) {
+		reviewPending();
+		return;
+	}
+	const t = input.value.trim();
+	const ready = attachments.value.filter((a) => a.file_url);
+	if ((!t && !ready.length) || busy.value || uploading.value || holdActive.value) {
+		preserveDraft();
+		return;
+	}
+	error.value = "";
+	let request;
+	try {
+		if (editing) {
+			if (editing.state !== "rejected") {
+				reviewPending();
+				return;
+			}
+			Object.assign(editing, draftSnapshot(), {
+				text: t,
+				attachments: ready.map((a) => ({ file_url: a.file_url, name: a.name })),
+			});
+			if (!sendRecovery.retry(editing)) return;
+			request = editing;
+		} else {
+			request = sendRecovery.stage("", t, ready);
+			Object.assign(request, draftSnapshot(), {
+				text: t,
+				attachments: ready.map((a) => ({ file_url: a.file_url, name: a.name })),
+			});
+		}
+	} catch {
+		error.value = "Could not prepare the message. Your draft is preserved.";
+		preserveDraft();
+		return;
+	}
+	busy.value = true;
+	submitted = true;
+	recoveryState.newChatPicks = {
+		model: request.model,
+		thinking: request.thinking,
+		autoMode: request.autoMode,
+	};
+	const attempt = request.id;
+	const operation = sendRecovery.begin(request);
+	input.value = "";
+	attachments.value.forEach((a) => a.preview && URL.revokeObjectURL(a.preview));
+	attachments.value = [];
+	if (!editing) recoveryState.heroDraft = null;
+	recoveryState.editingNewRequest = null;
+	router.push("/send-recovery");
+	try {
+		const outcome = await observeDelivery(api.sendRecoverableMessage(request), () => {
+			if (request.id === attempt) sendRecovery.settle(request, null, operation);
+		});
+		if (request.id === attempt) sendRecovery.settle(request, outcome, operation);
+	} catch (error) {
+		if (request.id === attempt) {
+			sendRecovery.settle(request, null, operation);
+			if (request.operation === operation && request.state === "uncertain")
+				request.note = deliveryFailureCopy(error);
+		}
+	} finally {
+		busy.value = false;
+	}
+}
+
+let autoTouched = !!editing || !!restored?.autoTouched;
+function toggleAuto() {
+	autoTouched = true;
+	if (autoArmed.value) {
+		autoArmed.value = false; // turning off never asks
+		return;
+	}
+	if (autoAcked.value) autoArmed.value = true;
+	else autoSheet.value = true;
+}
+
+async function confirmAuto() {
+	if (autoSaving.value) return;
+	autoSaving.value = true;
+	try {
+		await api.updateMySettings({ auto_mode_acknowledged: 1 });
+		autoAcked.value = true;
+		autoArmed.value = true;
+		autoSheet.value = false;
+	} catch (e) {
+		// Not saved: stay off and close, the next tap asks again.
+		autoSheet.value = false;
+		error.value = e?.message || "Couldn't turn on auto mode.";
+	} finally {
+		autoSaving.value = false;
+	}
+}
+
+async function attach(e) {
+	const files = [...(e.target.files || [])];
+	e.target.value = "";
+	if (!files.length) return;
+	error.value = "";
+
+	const staged = files.map((f, i) => ({
+		key: `att-${Date.now()}-${i}`,
+		name: f.name,
+		file: f,
+		preview: f.type.startsWith("image/") ? URL.createObjectURL(f) : "",
+		uploading: true,
+	}));
+	attachments.value.push(...staged);
+
+	await Promise.all(
+		attachments.value.slice(-staged.length).map(async (a) => {
+			try {
+				const up = await api.uploadFile(a.file);
+				Object.assign(a, { file_url: up.file_url, uploading: false });
+			} catch (err) {
+				a.uploading = false;
+				a.uploadError = true;
+				error.value = err?.message || `Couldn't upload ${a.name}.`;
+			}
+		})
+	);
+}
+
+function removeAttachment(key) {
+	const row = attachments.value.find((a) => a.key === key);
+	if (row?.preview) URL.revokeObjectURL(row.preview);
+	attachments.value = attachments.value.filter((a) => a.key !== key);
+}
+
+function onKeydown(e) {
+	if (enterSends(e, navigator.userAgent)) {
+		e.preventDefault();
+		send();
+	}
+}
+
+onMounted(async () => {
+	// Two independent reads - fire together so the starter grid isn't blocked on
+	// the model settings (and vice versa). The grid already shows DEFAULT_STARTERS
+	// from first paint, so a slow/failed suggestions read just leaves the defaults.
+	const [ui, sugg, mine] = await Promise.allSettled([
+		api.getChatUiSettings(),
+		api.getPromptSuggestions(),
+		api.getMySettings(),
+	]);
+	if (ui.status === "fulfilled") settings.value = ui.value;
+	if (sugg.status === "fulfilled")
+		starters.value = normalizeStarters(sugg.value?.data?.suggestions);
+	// A failed read just means not pre-armed, and the first tap on the toggle asks.
+	if (mine.status === "fulfilled" && mine.value?.data) {
+		const d = mine.value.data;
+		autoAcked.value = !!d.auto_mode_acknowledged;
+		// Only pre-arm if the user has not already tapped it while this loaded.
+		if (d.default_auto_mode && !autoTouched) autoArmed.value = true;
+	}
+});
+onUnmounted(() => {
+	preserveDraft();
+	recoveryState.editingNewRequest = null;
+	attachments.value.forEach((a) => a.preview && URL.revokeObjectURL(a.preview));
+});
+</script>
+
+<template>
+	<div class="jv-bar is-bare">
+		<button class="jv-icon-btn" aria-label="Menu" @click="store.drawerOpen = true">
+			<svg
+				viewBox="0 0 24 24"
+				width="20"
+				height="20"
+				fill="none"
+				stroke="currentColor"
+				stroke-width="1.8"
+				stroke-linecap="round"
+			>
+				<path d="M3 6h18M3 12h18M3 18h18" />
+			</svg>
+		</button>
+		<span class="jv-spacer" />
+		<!-- Same place as the native app: the bell lives on the new-chat header
+		     only. It is where you land when you come back to the app, which is
+		     exactly when you want to know what happened while you were gone. -->
+		<button
+			class="jv-icon-btn"
+			aria-label="Notifications"
+			@click="router.push('/notifications')"
+		>
+			<svg
+				viewBox="0 0 24 24"
+				width="20"
+				height="20"
+				fill="none"
+				stroke="currentColor"
+				stroke-width="1.8"
+				stroke-linecap="round"
+				stroke-linejoin="round"
+			>
+				<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0" />
+			</svg>
+			<span v-if="feed.unread" class="jv-bell-dot" />
+		</button>
+	</div>
+
+	<div class="jv-hero">
+		<BrandMark :size="56" :mood="holdActive ? 'upgrading' : 'star'" />
+		<h1 class="jv-greeting">{{ greeting }}</h1>
+	</div>
+
+	<!-- Starter prompts: tap to prefill the composer (never sends). Shown from
+	     first paint (defaults, then personalised) and hidden once the user has a
+	     draft, so a tap can never clobber text they've started. -->
+	<div v-if="starters.length && !hasDraft" class="jv-starters">
+		<div class="jv-starters-grid">
+			<button
+				v-for="(s, i) in starters"
+				:key="`${s.title}-${i}`"
+				type="button"
+				class="jv-starter"
+				:class="`jv-tint-${starterTint(i)}`"
+				@click="useStarter(s)"
+			>
+				<span class="jv-starter-k">{{ s.title }}</span>
+				<span class="jv-starter-p">{{ s.prompt }}</span>
+			</button>
+		</div>
+		<p class="jv-starter-hint">Tap to start. You can edit before sending.</p>
+	</div>
+
+	<div class="jv-heroc jv-safe-bottom">
+		<div v-if="error" class="jv-heroc-err">
+			<svg
+				viewBox="0 0 24 24"
+				width="14"
+				height="14"
+				fill="none"
+				stroke="currentColor"
+				stroke-width="2"
+				stroke-linecap="round"
+			>
+				<circle cx="12" cy="12" r="9" />
+				<path d="M12 8v5M12 16h.01" />
+			</svg>
+			{{ error }}
+		</div>
+
+		<button v-if="pendingNewChat" class="jv-btn" @click="reviewPending">
+			Review your pending message
+		</button>
+
+		<!-- One card: attachments, the field, and every control that acts on it.
+		     The chat bar belongs in a chat; a blank screen deserves a composer. -->
+		<div class="jv-card">
+			<div v-if="attachments.length" class="jv-atts">
+				<div v-for="a in attachments" :key="a.key" class="jv-att">
+					<img v-if="a.preview" class="jv-att-img" :src="a.preview" :alt="a.name" />
+					<div v-else class="jv-att-file">
+						<svg
+							viewBox="0 0 24 24"
+							width="16"
+							height="16"
+							fill="none"
+							stroke="currentColor"
+							stroke-width="1.8"
+							stroke-linecap="round"
+							stroke-linejoin="round"
+						>
+							<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+							<path d="M14 2v6h6" />
+						</svg>
+						<span class="jv-att-name">{{ a.name }}</span>
+					</div>
+					<span v-if="a.uploadError" role="alert"
+						>Upload failed. Remove and attach again.</span
+					>
+					<div v-if="a.uploading" class="jv-att-busy">
+						<span class="jv-spinner is-light" />
+					</div>
+					<button class="jv-att-x" aria-label="Remove" @click="removeAttachment(a.key)">
+						<svg
+							viewBox="0 0 24 24"
+							width="11"
+							height="11"
+							fill="none"
+							stroke="currentColor"
+							stroke-width="2.6"
+							stroke-linecap="round"
+						>
+							<path d="M18 6 6 18M6 6l12 12" />
+						</svg>
+					</button>
+				</div>
+			</div>
+
+			<textarea
+				ref="inputEl"
+				v-model="input"
+				rows="1"
+				:placeholder="`Message ${agentName}…`"
+				@input="autoGrow"
+				@keydown="onKeydown"
+			/>
+
+			<div class="jv-card-row">
+				<input ref="fileEl" type="file" multiple hidden @change="attach" />
+				<button class="jv-round" aria-label="Attach a file" @click="fileEl.click()">
+					<svg
+						viewBox="0 0 24 24"
+						width="17"
+						height="17"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="2"
+						stroke-linecap="round"
+					>
+						<path d="M12 5v14M5 12h14" />
+					</svg>
+				</button>
+
+				<button v-if="models.length" class="jv-modelchip" @click="modelSheet = true">
+					<span class="jv-dot" />
+					<span class="jv-modelchip-name">{{ currentModel || "Model" }}</span>
+					<svg
+						viewBox="0 0 24 24"
+						width="13"
+						height="13"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="2"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+					>
+						<path d="m6 9 6 6 6-6" />
+					</svg>
+				</button>
+
+				<AutoModeToggle :on="autoView.on" @toggle="toggleAuto" />
+
+				<span class="jv-spacer" />
+
+				<button
+					v-if="!hasDraft && micEnabled"
+					class="jv-mic"
+					aria-label="Dictate"
+					@click="voiceOpen = true"
+				>
+					<svg
+						viewBox="0 0 24 24"
+						width="19"
+						height="19"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="1.8"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+					>
+						<path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
+						<path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3" />
+					</svg>
+				</button>
+				<button
+					v-if="hasDraft"
+					class="jv-send"
+					aria-label="Send"
+					:disabled="busy || uploading"
+					@click="send()"
+				>
+					<span v-if="busy" class="jv-spinner is-light" />
+					<svg
+						v-else
+						viewBox="0 0 24 24"
+						width="19"
+						height="19"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="2.1"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+					>
+						<path d="M12 19V5M5 12l7-7 7 7" />
+					</svg>
+				</button>
+			</div>
+		</div>
+	</div>
+
+	<!-- model + effort -->
+	<Sheet :open="modelSheet" @close="modelSheet = false">
+		<div class="jv-msheet">
+			<div class="jv-msheet-head">
+				<span>Model</span>
+				<button class="jv-x" aria-label="Close" @click="modelSheet = false">
+					<svg
+						viewBox="0 0 24 24"
+						width="16"
+						height="16"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="2.2"
+						stroke-linecap="round"
+					>
+						<path d="M18 6 6 18M6 6l12 12" />
+					</svg>
+				</button>
+			</div>
+
+			<div class="jv-msheet-body">
+				<button
+					v-for="m in models"
+					:key="m"
+					class="jv-mrow"
+					@click="
+						selectedModel = m === currentModel ? '' : m;
+						setPrefs({ defaultModel: selectedModel });
+					"
+				>
+					<span class="jv-radio" :class="{ 'is-on': m === currentModel }" />
+					<span class="jv-mrow-text">
+						<span class="jv-mrow-name">{{ m }}</span>
+						<span class="jv-mrow-desc">{{ modelDesc(m) }}</span>
+					</span>
+					<svg
+						v-if="m === currentModel"
+						class="jv-check"
+						viewBox="0 0 24 24"
+						width="18"
+						height="18"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="2.4"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+					>
+						<path d="M20 6 9 17l-5-5" />
+					</svg>
+				</button>
+				<div v-if="!models.length" class="jv-mnone">
+					No models available on your plan yet.
+				</div>
+
+				<template v-if="effortOn">
+					<div class="jv-sep" />
+
+					<div class="jv-msheet-sub">Effort</div>
+					<div class="jv-msheet-hint">
+						How much {{ agentName }} thinks before it acts.
+					</div>
+					<div class="jv-seg">
+						<button
+							v-for="e in EFFORT"
+							:key="e.value"
+							class="jv-seg-btn"
+							:class="{ 'is-on': selectedEffort === e.value }"
+							@click="
+								selectedEffort = e.value;
+								setPrefs({ effort: e.value });
+							"
+						>
+							<span>{{ e.value }}</span>
+							<small>{{ e.hint }}</small>
+						</button>
+					</div>
+				</template>
+
+				<button class="jv-done" @click="modelSheet = false">Done</button>
+			</div>
+		</div>
+	</Sheet>
+
+	<!-- first-time auto mode warning -->
+	<Sheet :open="autoSheet" @close="autoSheet = false">
+		<div class="jv-msheet">
+			<div class="jv-msheet-head">
+				<span>Turn on auto mode?</span>
+				<button class="jv-x" aria-label="Close" @click="autoSheet = false">
+					<svg
+						viewBox="0 0 24 24"
+						width="16"
+						height="16"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="2.2"
+						stroke-linecap="round"
+					>
+						<path d="M18 6 6 18M6 6l12 12" />
+					</svg>
+				</button>
+			</div>
+			<div class="jv-msheet-body">
+				<p class="jv-autosheet-msg">
+					Jarvis will apply changes without asking first. Deletes, cancels and amends
+					still ask. Once a chat starts in auto mode, it stays in auto mode.
+				</p>
+				<p class="jv-autosheet-msg is-warn">
+					Not recommended if you're new to ERPNext or Jarvis.
+				</p>
+				<div class="jv-menu-actions">
+					<button class="jv-btn is-ghost" @click="autoSheet = false">Cancel</button>
+					<button class="jv-btn is-danger" :disabled="autoSaving" @click="confirmAuto">
+						Turn on auto mode
+					</button>
+				</div>
+			</div>
+		</div>
+	</Sheet>
+
+	<VoiceSheet :open="voiceOpen" @close="voiceOpen = false" @transcript="(t) => send(t)" />
+</template>
+
+<style scoped>
+.jv-bar.is-bare {
+	background: transparent;
+	border-bottom: 0;
+}
+.jv-icon-btn {
+	position: relative;
+}
+/* Unread work is waiting. A count would be false precision — the feed is
+   assembled from live events, so "some" is the only honest number. */
+.jv-bell-dot {
+	position: absolute;
+	top: 8px;
+	right: 8px;
+	width: 8px;
+	height: 8px;
+	border-radius: 999px;
+	background: var(--accent);
+	border: 2px solid var(--bg);
+}
+.jv-hero {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 14px;
+	padding: 18px;
+}
+/* The name is arbitrary-length, so this line has to survive "Administrator"
+   as well as "Jo". At 24px/600 the longest common case measured 326px against
+   324px of usable width, so it overflowed its own padding and sat edge to edge.
+   Smaller and lighter, capped short of the padding, and balanced so a wrap
+   splits evenly instead of dropping one orphaned word. */
+.jv-greeting {
+	margin: 0;
+	max-width: 20ch;
+	font-size: 21px;
+	font-weight: 550;
+	letter-spacing: -0.3px;
+	line-height: 1.25;
+	color: var(--ink9);
+	text-align: center;
+	text-wrap: balance;
+}
+
+.jv-heroc {
+	flex: none;
+	padding: 6px 14px 10px;
+}
+.jv-heroc-err {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-bottom: 8px;
+	padding: 10px;
+	border-radius: 10px;
+	background: var(--red-bg);
+	color: var(--red);
+	font-size: 12px;
+	font-weight: 500;
+}
+.jv-card {
+	padding: 14px 15px 11px;
+	border: 1px solid var(--border2);
+	border-radius: 20px;
+	background: var(--card);
+	box-shadow: 0 1px 2px rgba(0, 0, 0, 0.07);
+}
+.jv-card textarea {
+	display: block;
+	width: 100%;
+	border: 0;
+	outline: none;
+	resize: none;
+	background: transparent;
+	color: var(--ink9);
+	font: inherit;
+	/* 15.5px, not 14.5: this is the one field the user actually composes in,
+	   and the reference apps sit around 16px. Below that it reads as a caption
+	   rather than the primary input. */
+	font-size: 15.5px;
+	line-height: 1.45;
+	padding: 2px 0 12px;
+	max-height: 120px;
+}
+.jv-card-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+.jv-spacer {
+	flex: 1;
+}
+.jv-round {
+	display: grid;
+	place-items: center;
+	width: 34px;
+	height: 34px;
+	flex: none;
+	border: 1px solid var(--border2);
+	border-radius: 999px;
+	background: transparent;
+	color: var(--ink6);
+	cursor: pointer;
+}
+.jv-modelchip {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	max-width: 190px;
+	height: 34px;
+	padding: 0 12px;
+	border: 1px solid var(--border2);
+	border-radius: 999px;
+	background: transparent;
+	color: var(--ink7);
+	font: inherit;
+	cursor: pointer;
+}
+.jv-modelchip-name {
+	font-size: 12.5px;
+	font-weight: 600;
+	color: var(--ink9);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.jv-dot {
+	width: 6px;
+	height: 6px;
+	flex: none;
+	border-radius: 999px;
+	background: var(--accent);
+}
+.jv-mic {
+	display: grid;
+	place-items: center;
+	width: 38px;
+	height: 38px;
+	flex: none;
+	border: 0;
+	border-radius: 999px;
+	background: var(--card3);
+	color: var(--ink8);
+	cursor: pointer;
+}
+.jv-send {
+	display: grid;
+	place-items: center;
+	width: 38px;
+	height: 38px;
+	flex: none;
+	border: 0;
+	border-radius: 999px;
+	background: var(--inv-bg);
+	color: var(--inv-ink);
+	cursor: pointer;
+}
+.jv-send:disabled {
+	opacity: 0.5;
+}
+
+/* attachments */
+.jv-atts {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 12px;
+	padding-bottom: 12px;
+}
+.jv-att {
+	position: relative;
+}
+.jv-att-img {
+	display: block;
+	width: 52px;
+	height: 52px;
+	object-fit: cover;
+	border: 1px solid var(--border);
+	border-radius: 9px;
+	background: var(--card2);
+}
+.jv-att-file {
+	display: flex;
+	align-items: center;
+	gap: 7px;
+	max-width: 180px;
+	height: 52px;
+	padding: 0 10px;
+	border: 1px solid var(--border);
+	border-radius: 9px;
+	background: var(--card2);
+	color: var(--ink6);
+}
+.jv-att-name {
+	font-size: 11.5px;
+	font-weight: 500;
+	color: var(--ink8);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.jv-att-busy {
+	position: absolute;
+	inset: 0;
+	display: grid;
+	place-items: center;
+	border-radius: 9px;
+	background: rgba(0, 0, 0, 0.35);
+}
+.jv-att-x {
+	position: absolute;
+	top: -6px;
+	right: -6px;
+	display: grid;
+	place-items: center;
+	width: 20px;
+	height: 20px;
+	padding: 0;
+	border: 2px solid var(--card);
+	border-radius: 999px;
+	background: var(--inv-bg);
+	color: var(--inv-ink);
+	cursor: pointer;
+}
+
+/* model sheet */
+.jv-msheet {
+	display: flex;
+	flex-direction: column;
+	min-height: 0;
+}
+.jv-msheet-head {
+	display: flex;
+	align-items: center;
+	padding: 6px 20px 4px;
+	font-size: 16px;
+	font-weight: 600;
+	letter-spacing: -0.2px;
+	color: var(--ink9);
+}
+.jv-msheet-head span {
+	flex: 1;
+}
+.jv-x {
+	display: grid;
+	place-items: center;
+	width: 30px;
+	height: 30px;
+	border: 0;
+	border-radius: 999px;
+	background: var(--card2);
+	color: var(--ink6);
+	cursor: pointer;
+}
+.jv-msheet-body {
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
+	padding: 6px 12px 18px;
+}
+.jv-mrow {
+	display: flex;
+	align-items: flex-start;
+	gap: 11px;
+	width: 100%;
+	padding: 11px 12px;
+	border: 0;
+	border-radius: 12px;
+	background: transparent;
+	font: inherit;
+	text-align: left;
+	cursor: pointer;
+}
+.jv-mrow:active {
+	background: var(--card2);
+}
+.jv-radio {
+	width: 9px;
+	height: 9px;
+	margin-top: 5px;
+	flex: none;
+	border-radius: 999px;
+	background: var(--ink3);
+}
+.jv-radio.is-on {
+	background: var(--accent);
+}
+.jv-mrow-text {
+	flex: 1;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+}
+.jv-mrow-name {
+	font-size: 14px;
+	font-weight: 600;
+	color: var(--ink9);
+}
+.jv-mrow-desc {
+	margin-top: 2px;
+	font-size: 12px;
+	line-height: 1.4;
+	color: var(--ink5);
+}
+.jv-check {
+	flex: none;
+	margin-top: 2px;
+	color: var(--accent);
+}
+.jv-mnone {
+	padding: 12px;
+	font-size: 12.5px;
+	color: var(--ink5);
+}
+.jv-sep {
+	height: 1px;
+	margin: 8px 8px;
+	background: var(--border);
+}
+.jv-msheet-sub {
+	padding: 0 8px;
+	font-size: 14px;
+	font-weight: 600;
+	color: var(--ink9);
+}
+.jv-msheet-hint {
+	padding: 4px 8px 8px;
+	font-size: 12px;
+	line-height: 1.4;
+	color: var(--ink5);
+}
+.jv-seg {
+	display: flex;
+	gap: 4px;
+	padding: 4px;
+	margin: 0 8px;
+	border: 1px solid var(--border);
+	border-radius: 12px;
+	background: var(--card2);
+}
+.jv-seg-btn {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	gap: 1px;
+	padding: 8px 4px;
+	border: 0;
+	border-radius: 9px;
+	background: transparent;
+	color: var(--ink6);
+	font: inherit;
+	cursor: pointer;
+}
+.jv-seg-btn span {
+	font-size: 13.5px;
+	font-weight: 500;
+}
+.jv-seg-btn small {
+	font-size: 10.5px;
+	color: var(--ink4);
+}
+.jv-seg-btn.is-on {
+	background: var(--card);
+	color: var(--accent);
+	box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+.jv-seg-btn.is-on span {
+	font-weight: 600;
+}
+.jv-done {
+	width: calc(100% - 16px);
+	height: 46px;
+	margin: 16px 8px 0;
+	border: 0;
+	border-radius: 12px;
+	background: var(--accent-solid);
+	color: #fff;
+	font: inherit;
+	font-size: 15px;
+	font-weight: 600;
+	cursor: pointer;
+}
+.jv-autosheet-msg {
+	margin: 4px 8px 0;
+	font-size: 14px;
+	line-height: 1.5;
+	color: var(--ink7);
+}
+.jv-autosheet-msg.is-warn {
+	margin-top: 8px;
+	font-weight: 600;
+	color: var(--red);
+}
+/* Sheet buttons: copied from ChatView's rename sheet. */
+.jv-menu-actions {
+	display: flex;
+	gap: 10px;
+	margin: 16px 8px 0;
+}
+.jv-btn {
+	flex: 1;
+	height: 46px;
+	border: 0;
+	border-radius: 12px;
+	font: inherit;
+	font-size: 15px;
+	font-weight: 600;
+	cursor: pointer;
+}
+.jv-btn.is-danger {
+	background: var(--red);
+	color: #fff;
+}
+.jv-btn.is-ghost {
+	border: 1px solid var(--border2);
+	background: var(--card);
+	color: var(--ink8);
+}
+.jv-btn:disabled {
+	opacity: 0.55;
+}
+.jv-spinner {
+	width: 16px;
+	height: 16px;
+	border-radius: 50%;
+	border: 2px solid var(--card3);
+	border-top-color: var(--accent);
+	animation: jv-spin 0.7s linear infinite;
+}
+.jv-spinner.is-light {
+	border-color: rgba(255, 255, 255, 0.35);
+	border-top-color: #fff;
+}
+@keyframes jv-spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+/* Starter prompts on the empty new-chat screen (Move A). */
+.jv-starters {
+	width: 100%;
+	margin: 0 0 4px;
+}
+/* On a short (e.g. landscape) viewport, drop the grid rather than push the
+   composer off-screen - this view has no document scroll. */
+@media (max-height: 640px) {
+	.jv-starters {
+		display: none;
+	}
+}
+.jv-starters-grid {
+	display: grid;
+	grid-template-columns: 1fr;
+	gap: 8px;
+}
+@media (min-width: 420px) {
+	.jv-starters-grid {
+		grid-template-columns: 1fr 1fr;
+	}
+}
+.jv-starter {
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+	text-align: left;
+	min-height: 44px;
+	padding: 10px 12px;
+	border: 1px solid var(--border);
+	border-radius: 12px;
+	background: var(--bg);
+	color: inherit;
+	cursor: pointer;
+}
+.jv-starter-k {
+	font-size: 11px;
+	font-weight: 700;
+	text-transform: uppercase;
+	letter-spacing: 0.03em;
+}
+.jv-starter-p {
+	font-size: 13px;
+	line-height: 1.35;
+}
+/* Tint is a decorative background only; the label uses the inherited default
+   ink so its contrast passes AA on every tint, in both light and dark. */
+.jv-tint-a {
+	background: var(--green-bg);
+}
+.jv-tint-b {
+	background: var(--amber-bg);
+}
+.jv-tint-c {
+	background: var(--accent-bg);
+}
+.jv-starter-hint {
+	margin: 8px 2px 0;
+	font-size: 11px;
+	opacity: 0.6;
+	text-align: center;
+}
+</style>

@@ -1,0 +1,953 @@
+<template>
+	<DocPage
+		:breadcrumbs="breadcrumbs"
+		:title="pageTitle"
+		:status-badge="null"
+		:dirty="dirty"
+		:loading="loading"
+		:error="loadError"
+	>
+		<template #actions>
+			<SyncPill ref="syncPill" />
+			<PromotionStatusChip v-if="isOwner && myPromo" :req="myPromo" noun="skill" />
+			<Badge
+				v-if="skill && !canEdit"
+				variant="subtle"
+				theme="gray"
+				size="lg"
+				:label="`Shared by ${sharedBy || 'another user'} · read-only`"
+			/>
+			<Dropdown v-if="isOwner && !isNew" :options="overflowOptions">
+				<Button icon="more-horizontal" variant="ghost" />
+			</Dropdown>
+			<Button
+				v-if="canEdit"
+				variant="solid"
+				label="Save"
+				:disabled="!dirty"
+				:loading="saving"
+				@click="save"
+			/>
+		</template>
+
+		<template #main>
+			<!-- An admin's hold: the one thing on this page the owner cannot change. -->
+			<Banner
+				v-if="hold"
+				class="mb-4"
+				data-testid="hold-banner"
+				type="warning"
+				title="On hold"
+				:message="holdBanner"
+			/>
+			<!-- A skill reviewer editing a shared skill someone else owns (5c). After the
+			     hold banner: the hold is the more urgent thing to say. -->
+			<Banner
+				v-if="reviewerEditing"
+				class="mb-4"
+				data-testid="reviewer-banner"
+				type="info"
+				:message="reviewerBanner"
+			/>
+			<DocSection label="Details">
+				<div class="space-y-4">
+					<FormControl
+						type="text"
+						label="Name"
+						required
+						placeholder="e.g. monthly-close"
+						:modelValue="form.skill_name"
+						:disabled="!isNew || reviewerEditing || saving"
+						:description="
+							isNew
+								? `Lowercase letters, digits and hyphens - trigger it in chat with /${
+										form.skill_name || 'name'
+								  }.`
+								: 'Skill names can\'t be changed after creation.'
+						"
+						@update:modelValue="(v) => (form.skill_name = v)"
+					/>
+					<FormControl
+						type="textarea"
+						label="Description"
+						required
+						:rows="2"
+						placeholder="When should the assistant use this skill?"
+						description="A short hint so the assistant knows when this skill applies."
+						:modelValue="form.description"
+						:disabled="readonly"
+						@update:modelValue="(v) => (form.description = v)"
+					/>
+					<Switch
+						v-model="form.enabled"
+						label="Enabled"
+						:description="enabledDescription"
+						:disabled="enabledLocked"
+					/>
+					<Switch
+						v-model="form.user_invocable"
+						label="User invocable"
+						description="Show in the chat / menu so users can trigger it directly."
+						:disabled="readonly"
+					/>
+					<!-- "Approve & run" arming (skill approve-and-run, D-CONTROL):
+					     admin-only to turn ON, free to turn OFF (the kill switch).
+					     Only meaningful on a saved skill, so hidden while creating. -->
+					<Switch
+						v-if="!isNew"
+						v-model="form.allow_approve_run"
+						label="Allow Approve & run"
+						:description="armDescription"
+						:disabled="armLocked"
+					/>
+					<SkillRolesField
+						v-if="rolesEditable"
+						v-model="form.allowed_roles"
+						:options="roleOptions"
+						:disabled="saving"
+					/>
+				</div>
+			</DocSection>
+
+			<DocSection label="File Box">
+				<div class="space-y-4">
+					<Switch
+						v-model="form.use_in_file_box"
+						label="Use in File Box"
+						:description="fileBoxDescription"
+						:disabled="fileBoxLocked"
+					/>
+					<!-- Link-style search over the types File Box may draft (the server's
+					     rule); its refusal on save shows here, not as a toast. The
+					     fieldset disables it while saving. -->
+					<fieldset
+						class="min-w-0"
+						:disabled="saving"
+						:aria-describedby="CREATES_HINT_ID"
+					>
+						<Autocomplete
+							v-if="canEdit"
+							label="File Box creates"
+							:options="createsOptions"
+							:modelValue="form.file_box_creates"
+							placeholder="Any document type"
+							@update:modelValue="setCreates"
+							@update:query="searchCreates"
+						/>
+						<FormControl
+							v-else
+							type="text"
+							label="File Box creates"
+							:modelValue="form.file_box_creates || 'Any document type'"
+							:disabled="true"
+						/>
+						<p
+							v-if="createsError"
+							:id="CREATES_HINT_ID"
+							class="mt-1.5 text-p-sm text-ink-red-4"
+							role="alert"
+						>
+							{{ createsError }}
+						</p>
+						<p v-else :id="CREATES_HINT_ID" class="mt-1.5 text-p-sm text-ink-gray-5">
+							The document type File Box drafts when it follows this skill (e.g.
+							Purchase Invoice), whatever the document's printed title says.
+						</p>
+					</fieldset>
+				</div>
+			</DocSection>
+
+			<DocSection label="Instructions">
+				<template #header-suffix>
+					<span class="text-ink-red-3 select-none" aria-hidden="true">*</span>
+					<span class="sr-only">(required)</span>
+				</template>
+				<!-- lg+: textarea and live rendered preview side by side (preview
+				     tracks form.instructions as you type); below lg a Preview button
+				     toggles between them - exactly WikiPageDialog.vue:80-107's pattern,
+				     replicated here for the Instructions markdown (goal item 1). -->
+				<div class="grid gap-4 lg:grid-cols-2">
+					<FormControl
+						type="textarea"
+						:rows="14"
+						:class="[
+							'font-mono [&_textarea]:min-h-[320px]',
+							previewingInstructions ? 'hidden lg:block' : '',
+						]"
+						placeholder="Markdown instructions the assistant follows when this skill runs…"
+						description="Markdown instructions the model follows when this skill runs."
+						:modelValue="form.instructions"
+						:disabled="readonly"
+						@update:modelValue="(v) => (form.instructions = v)"
+					/>
+					<div :class="previewingInstructions ? '' : 'hidden lg:block'">
+						<div class="text-xs text-ink-gray-5">Preview</div>
+						<div
+							class="prose prose-sm mt-1 min-h-[320px] max-w-none overflow-y-auto rounded border px-3 py-2"
+							v-html="instructionsPreviewHtml"
+						/>
+					</div>
+				</div>
+				<Button
+					class="mt-2 lg:hidden"
+					variant="ghost"
+					:label="previewingInstructions ? 'Back to editing' : 'Preview'"
+					:iconLeft="previewingInstructions ? 'edit-2' : 'eye'"
+					@click="previewingInstructions = !previewingInstructions"
+				/>
+			</DocSection>
+		</template>
+
+		<template #aside>
+			<!-- new-record mode: metadata exists only after the first save -->
+			<div v-if="isNew" class="m-5 rounded-md border p-4 text-sm text-ink-gray-6">
+				Save to enable comments, attachments and sharing.
+			</div>
+
+			<DocMetaPanel v-else-if="isOwner && docmeta" :docmeta="docmeta" :can-write="true">
+				<!-- skills keep the child-table share model (§14 F1/DA-09) -->
+				<template #extra>
+					<SkillSharesBlock
+						class="px-5 py-4"
+						:shares="shares"
+						@manage="shareOpen = true"
+					/>
+				</template>
+			</DocMetaPanel>
+
+			<!-- A skill reviewer on someone else's shared skill: who owns it and its
+			     shares (a reviewer may change them, 5c). No docmeta (its read gate is the
+			     owner's), so no comments; no rename, promote or delete. -->
+			<div
+				v-else-if="reviewerEditing"
+				class="jv-skill-reviewer-card m-5 space-y-3 rounded-md border p-4"
+			>
+				<div class="flex items-center gap-2">
+					<Avatar size="md" :label="ownerName" />
+					<div class="text-base font-medium text-ink-gray-8">{{ ownerName }}</div>
+				</div>
+				<div class="text-sm text-ink-gray-5">
+					Owner. You can edit this skill as a skill reviewer; only its owner can rename,
+					promote or delete it.
+				</div>
+				<div v-if="skill.modified" class="text-sm text-ink-gray-5">
+					Updated {{ timeAgo(skill.modified) }}
+				</div>
+				<SkillSharesBlock
+					class="border-t pt-3"
+					:shares="shares"
+					@manage="shareOpen = true"
+				/>
+			</div>
+
+			<!-- shared-with-me: read-only info card (no docmeta - the docmeta read
+			     gate covers owner/SM/DocShare only; child-table shares would 403) -->
+			<div v-else-if="skill && !canEdit" class="m-5 space-y-3 rounded-md border p-4">
+				<div class="flex items-center gap-2">
+					<Avatar size="md" :label="sharedBy || 'another user'" />
+					<div class="text-base font-medium text-ink-gray-8">
+						{{ sharedBy || "Another user" }}
+					</div>
+				</div>
+				<div class="text-sm text-ink-gray-5">
+					Shared with you · read-only. Use /{{ form.skill_name }} in chat - you can’t
+					edit or re-share it.
+				</div>
+				<div v-if="skill.modified" class="text-sm text-ink-gray-5">
+					Updated {{ timeAgo(skill.modified) }}
+				</div>
+			</div>
+		</template>
+
+		<template #footer>
+			<CommentsSection
+				v-if="!isNew && isOwner && docmeta"
+				:docmeta="docmeta"
+				:can-comment="true"
+			/>
+		</template>
+	</DocPage>
+
+	<ShareDialog
+		v-model="shareOpen"
+		:skill="{ name: id, skill_name: form.skill_name }"
+		@saved="loadShares"
+	/>
+
+	<PromotionRequestDialog
+		v-model="promoDialog"
+		noun="skill"
+		:busy="promoBusy"
+		:multiple="true"
+		:min-scope="myEffectiveScope"
+		@submit="submitPromotion"
+	/>
+
+	<!-- Discard-changes confirm — styled with the chat SPA's jv-* design system
+	     (palette vars + overlay + jv-btn) to match the Settings dialog. -->
+	<div
+		v-if="discardOpen"
+		class="jv-settings-overlay jv-root"
+		:class="{ 'jv-dark': dark }"
+		:style="paletteVars"
+		@click.self="resolveDiscard(false)"
+		@keydown.esc="resolveDiscard(false)"
+	>
+		<div
+			class="jv-confirm"
+			role="alertdialog"
+			aria-modal="true"
+			aria-labelledby="discard-title"
+		>
+			<div class="jv-confirm-head">
+				<span class="jv-confirm-icon" aria-hidden="true">
+					<svg
+						width="17"
+						height="17"
+						viewBox="0 0 24 24"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="1.9"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+					>
+						<path
+							d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"
+						/>
+						<line x1="12" y1="9" x2="12" y2="13" />
+						<line x1="12" y1="17" x2="12.01" y2="17" />
+					</svg>
+				</span>
+				<h2 id="discard-title" class="jv-confirm-title">Discard unsaved changes?</h2>
+			</div>
+			<p class="jv-confirm-msg">
+				Your edits to this skill haven’t been saved and will be lost.
+			</p>
+			<div class="jv-confirm-actions">
+				<button
+					ref="cancelBtn"
+					type="button"
+					class="jv-btn jv-btn--ghost"
+					@click="resolveDiscard(false)"
+				>
+					Cancel
+				</button>
+				<button type="button" class="jv-btn jv-btn--danger" @click="resolveDiscard(true)">
+					Discard changes
+				</button>
+			</div>
+		</div>
+	</div>
+</template>
+
+<script setup>
+// Skill detail + create page (DESIGN-V3 §6.2): /skills/:id and /skills/new
+// share this component (isNew prop). Explicit Save (D21) with dirty guard,
+// read-only mode for shared-with-me skills, DocMetaPanel + child-table
+// Shared-with block (#extra) + ShareDialog, sync pill on save/delete.
+import {
+	ref,
+	reactive,
+	computed,
+	watch,
+	shallowRef,
+	nextTick,
+	onMounted,
+	onBeforeUnmount,
+} from "vue";
+import { useRouter, onBeforeRouteLeave } from "vue-router";
+import { armToggleLocked, armToggleDescription } from "./approveRunToggle";
+import {
+	Button,
+	Badge,
+	Avatar,
+	Dropdown,
+	FormControl,
+	Switch,
+	Autocomplete,
+	toast,
+	confirmDialog,
+} from "frappe-ui";
+import DocPage from "@/components/doc/DocPage.vue";
+import DocSection from "@/components/doc/DocSection.vue";
+import DocMetaPanel from "@/components/doc/DocMetaPanel.vue";
+import CommentsSection from "@/components/doc/CommentsSection.vue";
+import { useDocmeta } from "@/composables/useDocmeta";
+import { useShortcuts } from "@/composables/useShortcuts";
+import SyncPill from "./SyncPill.vue";
+import ShareDialog from "./ShareDialog.vue";
+import SkillRolesField from "./SkillRolesField.vue";
+import SkillSharesBlock from "./SkillSharesBlock.vue";
+import PromotionRequestDialog from "@/components/skills/PromotionRequestDialog.vue";
+import PromotionStatusChip from "@/components/skills/PromotionStatusChip.vue";
+import { getSkillsAreaCaps } from "@/api/personalise";
+import { requestSkillPromotion, mySkillPromotion } from "@/api/skills";
+import { isWiderScope } from "./promotionScope";
+import { renderMarkdown } from "@/markdown";
+import { timeAgo } from "@/utils/datetime";
+import { useJarvisTheme } from "@/theme";
+import "@/assets/settings.css"; // shared jv-* primitives (overlay, jv-btn) for the discard dialog
+import * as api from "@/api";
+import { errMessage as errMsg, errHtml } from "@/lib/errors";
+import { isCreatesError } from "@/lib/fileboxSkills";
+import { holdText, skillHold } from "@/lib/skillHold";
+import Banner from "@/components/Banner.vue";
+
+const props = defineProps({
+	id: { type: String, default: "" },
+	isNew: { type: Boolean, default: false },
+});
+
+const router = useRouter();
+// Chat-SPA theme (jv-* palette vars + dark flag) so the discard dialog matches
+// the chat surface / Settings dialog rather than frappe-ui's default styling.
+const { effectiveDark: dark, paletteVars } = useJarvisTheme();
+const DOCTYPE = "Jarvis Custom Skill";
+const FIELDS = [
+	"skill_name",
+	"description",
+	"instructions",
+	"user_invocable",
+	"enabled",
+	"allow_approve_run",
+	"use_in_file_box",
+	"file_box_creates",
+	"allowed_roles",
+];
+
+// ── state ────────────────────────────────────────────────────────────────────
+const skill = ref(null); // last server copy (null while new)
+const loading = ref(false);
+const loadError = ref("");
+const saving = ref(false);
+
+const form = reactive({
+	skill_name: "",
+	description: "",
+	instructions: "",
+	user_invocable: true,
+	enabled: true,
+	allow_approve_run: false,
+	use_in_file_box: true,
+	file_box_creates: "",
+	allowed_roles: [],
+});
+// Whether THIS viewer may ENABLE "Approve & run" (Jarvis Admin / System Manager).
+// Server-provided (get_custom_skill.can_arm); the doctype guard is the real gate,
+// this only drives the toggle's disabled state. Disabling is always free for the
+// owner, so it gates only the off -> on flip of an unarmed skill.
+const canArm = ref(false);
+const snapshot = ref({ ...form }); // saved-state copy (ref so `dirty` recomputes when reset after save)
+
+const docmeta = shallowRef(null); // useDocmeta instance (own skills only)
+const shares = ref([]); // [{name, full_name}]
+const shareOpen = ref(false);
+const syncPill = ref(null);
+
+// Only a reviewer/admin may push the shared container (apply is reviewer-gated -
+// security review PART 2 TASK 12). New skills default to private (User) scope
+// and are NEVER pushed, so for an ordinary user apply-on-save is both pointless
+// and a hard 403 (a scary red toast). Gate every apply on this signal.
+const isReviewer = ref(false);
+onMounted(async () => {
+	try {
+		const caps = await getSkillsAreaCaps();
+		isReviewer.value = !!(caps && caps.review);
+	} catch {
+		isReviewer.value = false;
+	}
+});
+
+// An admin's hold (null when not held): the skill is off and cannot be switched on
+// or allowed to write without asking until an admin releases it.
+const hold = computed(() => skillHold(skill.value));
+const holdLine = computed(() => holdText(hold.value));
+const holdBanner = computed(
+	() =>
+		`${holdLine.value.replace(
+			/\.+$/,
+			""
+		)}. The assistant does not use this skill until an admin releases it.`
+);
+
+const canEdit = computed(() => props.isNew || !!(skill.value && skill.value.can_edit));
+// The owner's own affordances (promote, delete, the overflow, sharing, comments)
+// follow is_owner; editing follows can_edit, which a skill reviewer also has on a
+// shared skill they do not own (5c). A server without is_owner: only the owner edits.
+const isOwner = computed(() => {
+	if (props.isNew) return true;
+	const s = skill.value;
+	if (!s) return false;
+	return s.is_owner == null ? !!s.can_edit : !!s.is_owner;
+});
+const reviewerEditing = computed(() => canEdit.value && !isOwner.value);
+const readonly = computed(() => !canEdit.value || saving.value);
+const sharedBy = computed(() => (skill.value && skill.value.shared_by) || "");
+const ownerName = computed(
+	() => (skill.value && (skill.value.owner_name || skill.value.shared_by)) || "another user"
+);
+const reviewerBanner = computed(
+	() =>
+		`You are editing ${ownerName.value}'s skill. Changes apply to everyone it is shared with.`
+);
+
+// A Role skill's roles, which a skill reviewer may change. The options are the roles
+// the server says this editor may add (role_options) and the ones the skill has.
+const rolesEditable = computed(
+	() => !props.isNew && canEdit.value && isReviewer.value && skill.value?.scope === "Role"
+);
+const roleOptions = computed(() => {
+	const saved = snapshot.value.allowed_roles || [];
+	const offered = (skill.value && skill.value.role_options) || [];
+	return [...new Set([...saved, ...offered])].sort();
+});
+
+// "Approve & run" arming (skill approve-and-run, D-CONTROL). Enabling (off -> on)
+// is Jarvis Admin / System Manager only; disabling is always free for the owner -
+// the toggle IS the kill switch. So the switch is locked ONLY when an UNARMED
+// skill can't be armed by this viewer; once it's armed (saved state), the owner
+// may always flip it back off. Mirrors the doctype's _guard_allow_approve_run_
+// enable exactly - and the server guard, not this, is the real authority.
+// Gating + disclosure live in a pure, node-tested module (approveRunToggle.js) so
+// the kill-switch truth table + the run_method-inclusive risk copy are verified
+// without a browser. savedArmed reads the SAVED state (snapshot), not the live
+// form, so toggling doesn't self-unlock the guard.
+const savedArmed = computed(() => !!snapshot.value.allow_approve_run);
+// A skill reviewer never changes it on someone else's skill (the server refuses).
+const REVIEWER_ARM_HELP = "A skill reviewer cannot change this on someone else's skill.";
+const armLocked = computed(
+	() =>
+		!!hold.value ||
+		reviewerEditing.value ||
+		armToggleLocked(readonly.value, savedArmed.value, canArm.value)
+);
+const armDescription = computed(() => {
+	if (hold.value) return holdLine.value;
+	if (reviewerEditing.value) return REVIEWER_ARM_HELP;
+	return armToggleDescription(savedArmed.value, canArm.value);
+});
+
+// ── promotion (requester side, Skills-area promotion surfacing) ───────────────
+// The owner of a private (User-scope) skill can ask a reviewer to widen it to a
+// role or the whole org. Learned rows are managed by the board, not promotion.
+const myPromo = ref(null); // {} | most-recent request for THIS skill (status chip)
+// The skill's REAL current shared scope by lineage (#595), from my_skill_promotion
+// - not skill.value.scope, which stays "User" forever on the private source even
+// after a shared copy is materialized from it. Always loaded, whether or not a
+// request row exists, so "can I promote further?" is answered correctly right
+// after an approval (no request in flight, but nothing wider may remain).
+const myEffectiveScope = ref("User");
+const promoDialog = ref(false);
+const promoBusy = ref(false);
+const canPromote = computed(
+	() =>
+		!props.isNew &&
+		isOwner.value &&
+		!!skill.value &&
+		!skill.value.managed_by_learning &&
+		isWiderScope("Org", myEffectiveScope.value)
+);
+// Offer the action only when there is no request in flight; a Pending request
+// shows the status chip instead (a rejected one may be re-requested).
+const promoPending = computed(() => !!(myPromo.value && myPromo.value.status === "Pending"));
+
+async function loadMyPromo() {
+	myPromo.value = null;
+	myEffectiveScope.value = "User";
+	if (props.isNew || !props.id || !isOwner.value) return;
+	try {
+		const res = await mySkillPromotion(props.id);
+		myEffectiveScope.value = (res && res.effective_scope) || "User";
+		myPromo.value = res && res.status ? res : null;
+	} catch {
+		// best-effort chip; a failure must not disturb the page
+	}
+}
+
+async function submitPromotion({ to_scope, target_role, target_roles, note }) {
+	promoBusy.value = true;
+	try {
+		await requestSkillPromotion({
+			name: props.id,
+			to_scope,
+			target_role,
+			target_roles,
+			note,
+		});
+		promoDialog.value = false;
+		toast.success("Promotion requested. A reviewer will decide.");
+		await loadMyPromo();
+	} catch (e) {
+		toast.error(errHtml(e));
+	} finally {
+		promoBusy.value = false;
+	}
+}
+
+// ── File Box: "Use in File Box" + "File Box creates" ─────────────────────────
+// A shared (Role/Org) skill: opting out is free, opting back in needs a reviewer
+// (the doctype's content guard), so a non-reviewer can't turn it on here. The hint
+// names a skill reviewer: one may edit a shared skill they do not own (5c), and the
+// owner reading this is not one.
+const FILE_BOX_HELP = "Let File Box use this skill automatically for matching documents";
+const fileBoxGated = computed(
+	() =>
+		isOwner.value &&
+		canEdit.value &&
+		!isReviewer.value &&
+		!!skill.value &&
+		["Role", "Org"].includes(skill.value.scope)
+);
+
+// "Enabled" follows the same rule on a shared skill: off is free, back on needs a
+// reviewer, so the switch is locked once it is saved off (the server refuses it).
+const ENABLED_HELP = "Off = saved as a draft, not used by the assistant.";
+const enabledLocked = computed(
+	() => readonly.value || !!hold.value || (fileBoxGated.value && !snapshot.value.enabled)
+);
+const enabledDescription = computed(() => {
+	if (hold.value) return holdLine.value;
+	if (!fileBoxGated.value) return ENABLED_HELP;
+	return snapshot.value.enabled
+		? `${ENABLED_HELP} Once off, only a skill reviewer can turn a shared skill back on.`
+		: `${ENABLED_HELP} Only a skill reviewer can turn a shared skill back on.`;
+});
+const fileBoxLocked = computed(
+	() => readonly.value || (fileBoxGated.value && !snapshot.value.use_in_file_box)
+);
+const fileBoxDescription = computed(() => {
+	if (!fileBoxGated.value) return FILE_BOX_HELP;
+	return snapshot.value.use_in_file_box
+		? `${FILE_BOX_HELP}. Once off, only a skill reviewer can turn it back on for a shared skill.`
+		: `${FILE_BOX_HELP}. Only a skill reviewer can turn it on for a shared skill.`;
+});
+
+// The picker searches the types the server accepts there (submittable, not in a
+// denied module); a FileBoxCreatesError on save shows on the field.
+const CREATES_HINT_ID = "skill-file-box-creates-hint";
+const createsTypes = ref([]);
+const createsError = ref("");
+const createsOptions = computed(() => {
+	const names = [...createsTypes.value];
+	if (form.file_box_creates && !names.includes(form.file_box_creates))
+		names.unshift(form.file_box_creates);
+	return [
+		{ label: "Any document type", value: "" },
+		...names.map((n) => ({ label: n, value: n })),
+	];
+});
+let createsSeq = 0; // the latest search wins over a slower earlier one
+async function loadCreates(txt) {
+	const seq = ++createsSeq;
+	let names = [];
+	try {
+		names = (await api.fileBoxDoctypes(txt)) || [];
+	} catch {
+		// none listed
+	}
+	if (seq === createsSeq) createsTypes.value = names;
+}
+let createsTimer = null;
+function searchCreates(txt) {
+	clearTimeout(createsTimer);
+	createsTimer = setTimeout(() => loadCreates(txt), 250);
+}
+function setCreates(option) {
+	if (saving.value) return;
+	form.file_box_creates = (option && option.value) || "";
+	createsError.value = "";
+}
+onBeforeUnmount(() => clearTimeout(createsTimer));
+
+// Instructions markdown preview (goal item 1) - mirrors WikiPageDialog's
+// `previewing`/`previewHtml` pair exactly, scoped to this one field.
+const previewingInstructions = ref(false);
+const instructionsPreviewHtml = computed(() =>
+	form.instructions
+		? renderMarkdown(form.instructions)
+		: '<p class="text-ink-gray-5">Nothing to preview yet.</p>'
+);
+
+function normalize(v) {
+	if (typeof v === "boolean") return v ? 1 : 0;
+	if (Array.isArray(v)) return [...v].sort().join("\n"); // a role set: order is not a change
+	return v == null ? "" : v;
+}
+const dirty = computed(() => {
+	if (!canEdit.value) return false;
+	return FIELDS.some((k) => normalize(form[k]) !== normalize(snapshot.value[k]));
+});
+
+const pageTitle = computed(() =>
+	props.isNew ? form.skill_name || "New Skill" : form.skill_name || props.id
+);
+const breadcrumbs = computed(() => [
+	{ label: "Skills", route: { name: "SkillsList" } },
+	props.isNew
+		? { label: "New Skill", route: { name: "SkillNew" } }
+		: { label: pageTitle.value, route: { name: "SkillDetail", params: { id: props.id } } },
+]);
+
+const overflowOptions = computed(() => {
+	const opts = [];
+	if (canPromote.value && !promoPending.value)
+		opts.push({ label: "Request promotion…", onClick: () => (promoDialog.value = true) });
+	opts.push({ label: "Delete", onClick: () => confirmDelete() });
+	return opts;
+});
+
+// ── load / init (re-runs when /skills/new saves and replaces to /skills/:id) ─
+function seed(data) {
+	form.skill_name = data.skill_name || "";
+	form.description = data.description || "";
+	form.instructions = data.instructions || "";
+	form.user_invocable = !!data.user_invocable;
+	form.enabled = !!data.enabled;
+	form.allow_approve_run = !!data.allow_approve_run;
+	form.use_in_file_box = data.use_in_file_box == null ? true : !!data.use_in_file_box;
+	form.file_box_creates = data.file_box_creates || "";
+	form.allowed_roles = [...(data.allowed_roles || [])];
+	snapshot.value = { ...form };
+}
+
+let bypassGuard = false;
+
+async function init() {
+	bypassGuard = false;
+	loadError.value = "";
+	shares.value = [];
+	shareOpen.value = false;
+	docmeta.value = null;
+	canArm.value = false;
+	createsError.value = "";
+	if (props.isNew) {
+		skill.value = null;
+		seed({ user_invocable: 1, enabled: 1 });
+		loadCreates("");
+		return;
+	}
+	if (!props.id) return;
+	loading.value = true;
+	try {
+		const full = await api.getCustomSkill(props.id);
+		skill.value = full;
+		canArm.value = !!full.can_arm;
+		seed(full);
+		if (full.can_edit) {
+			loadCreates("");
+			loadShares(); // a reviewer manages a shared skill's shares too (5c)
+		}
+		// The owner's panel only: a reviewer's docmeta read would be refused.
+		if (isOwner.value) {
+			docmeta.value = useDocmeta(DOCTYPE, props.id);
+			// created outside setup (async load / post-create replace) - fetch
+			// explicitly rather than relying on the composable's auto-load
+			if (docmeta.value && typeof docmeta.value.reload === "function")
+				docmeta.value.reload();
+			loadMyPromo();
+		}
+	} catch (e) {
+		loadError.value = errMsg(e);
+	} finally {
+		loading.value = false;
+	}
+}
+
+watch(() => [props.id, props.isNew], init, { immediate: true });
+
+async function loadShares() {
+	if (props.isNew || !props.id || !canEdit.value) return;
+	try {
+		const res = (await api.getSkillShares(props.id)) || {};
+		shares.value = res.users || [];
+	} catch (e) {
+		// owner or reviewer-on-shared endpoint; best-effort
+	}
+}
+
+// ── save / delete ────────────────────────────────────────────────────────────
+async function save() {
+	if (saving.value || !dirty.value) return;
+	const name = (form.skill_name || "").trim().toLowerCase();
+	if (!name) {
+		toast.error("Skill name is required.");
+		return;
+	}
+	if (!(form.description || "").trim()) {
+		toast.error("Description is required.");
+		return;
+	}
+	if (!(form.instructions || "").trim()) {
+		toast.error("Instructions are required.");
+		return;
+	}
+	if (rolesEditable.value && !form.allowed_roles.length) {
+		toast.error("Keep at least one role.");
+		return;
+	}
+	saving.value = true;
+	try {
+		const payload = {
+			skill_name: name,
+			description: form.description,
+			instructions: form.instructions,
+			user_invocable: form.user_invocable ? 1 : 0,
+			enabled: form.enabled ? 1 : 0,
+			// Inert on create (the switch is hidden while isNew and create_custom_skill
+			// ignores the key) - a skill is never born armed; arming is a post-create
+			// admin edit through the update path. Sent uniformly for the update branch.
+			allow_approve_run: form.allow_approve_run ? 1 : 0,
+			use_in_file_box: form.use_in_file_box ? 1 : 0,
+			file_box_creates: form.file_box_creates || "",
+		};
+		if (props.isNew) {
+			const res = (await api.createCustomSkill(payload)) || {};
+			const newName = (res.data && res.data.name) || "";
+			snapshot.value = { ...form }; // clean before navigating (leave guard)
+			// Reviewers only: a new skill is private (User) scope and never pushed,
+			// so ordinary users need no apply (and would 403 on the gated endpoint).
+			if (isReviewer.value) syncPill.value && syncPill.value.apply();
+			toast.success("Saved");
+			if (newName) router.replace("/skills/" + newName);
+		} else {
+			// send only the changed fields (the roles only exist on an update)
+			const full = { ...payload, allowed_roles: [...form.allowed_roles] };
+			const changed = {};
+			for (const k of FIELDS) {
+				if (normalize(form[k]) !== normalize(snapshot.value[k])) changed[k] = full[k];
+			}
+			await api.updateCustomSkill({ name: props.id, ...changed });
+			snapshot.value = { ...form };
+			skill.value = { ...skill.value, ...full };
+			// Reviewers only (see create branch): the shared push is reviewer-gated.
+			if (isReviewer.value) syncPill.value && syncPill.value.apply();
+			toast.success("Saved");
+		}
+	} catch (e) {
+		if (isCreatesError(e)) createsError.value = errMsg(e);
+		else toast.error(errHtml(e));
+	} finally {
+		saving.value = false;
+	}
+}
+
+function confirmDelete() {
+	confirmDialog({
+		title: "Delete skill?",
+		message: `Delete “${
+			form.skill_name || props.id
+		}”? It will be removed from your assistant.`,
+		onConfirm: async ({ hideDialog }) => {
+			try {
+				await api.deleteCustomSkill(props.id);
+				// reconcile the container only for reviewers (apply is gated); a
+				// deleted private skill never affected the shared push anyway.
+				if (isReviewer.value) await api.applyCustomSkills().catch(() => {});
+				bypassGuard = true;
+				hideDialog();
+				toast.success("Skill deleted");
+				router.push({ name: "SkillsList" });
+			} catch (e) {
+				toast.error(errHtml(e));
+			}
+		},
+	});
+}
+
+// ── dirty guard (D21) ────────────────────────────────────────────────────────
+// Custom discard dialog (instead of frappe-ui confirmDialog) so we get an
+// explicit Cancel action alongside Discard, both aligned on one row.
+const discardOpen = ref(false);
+const cancelBtn = ref(null);
+let pendingNext = null;
+
+onBeforeRouteLeave((to, from, next) => {
+	if (bypassGuard || !dirty.value) return next();
+	pendingNext = next;
+	discardOpen.value = true;
+	// Focus the safe default so Enter/Esc land on it (Esc bubbles to the overlay).
+	nextTick(() => cancelBtn.value?.focus());
+});
+
+// A hard reload / tab close while dirty escapes the in-app route guard above, so
+// an unsaved edit is silently lost. That matters most for the arm toggle: this
+// form is explicit-Save, so flipping the kill switch off does NOT persist until
+// Save - a user who closes the tab believing "off" took effect would leave the
+// skill armed server-side. Mirror AgentsList.vue's native-prompt guard.
+function onBeforeUnload(e) {
+	if (dirty.value) {
+		e.preventDefault();
+		e.returnValue = ""; // Chrome requires returnValue to show the prompt
+	}
+}
+onMounted(() => window.addEventListener("beforeunload", onBeforeUnload));
+onBeforeUnmount(() => window.removeEventListener("beforeunload", onBeforeUnload));
+
+// Ctrl/Cmd+S saves the skill in-app instead of falling through to the browser's
+// "Save Page". useShortcuts normalizes ⌘/Ctrl and preventDefaults the chord (so
+// the browser dialog never fires), even while the caret is in a field; save() is
+// itself a no-op unless dirty.
+useShortcuts([{ key: "s", meta: true, handler: save }]);
+
+// Resolve the pending navigation: proceed=true leaves the page, false stays.
+// Idempotent — closing via X/backdrop and a button click can't double-resolve.
+function resolveDiscard(proceed) {
+	discardOpen.value = false;
+	const next = pendingNext;
+	pendingNext = null;
+	if (next) next(proceed ? undefined : false);
+}
+</script>
+
+<style scoped>
+/* Compact confirm panel — mirrors the chat SPA / Settings dialog surface,
+   radius, shadow and pop-in. Colours resolve from the jv-* palette vars set
+   inline on the overlay root (:style="paletteVars"); jv-popin + the jv-btn
+   button styles come from the shared @/assets/settings.css. */
+.jv-confirm {
+	width: 384px;
+	max-width: 100%;
+	background: var(--surface);
+	border: 1px solid var(--border);
+	border-radius: 14px;
+	box-shadow: 0 24px 70px rgba(20, 20, 30, 0.28);
+	padding: 20px 20px 16px;
+	animation: jv-popin 0.16s ease;
+	font-family: "Inter", system-ui, sans-serif;
+}
+.jv-confirm-head {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	margin-bottom: 11px;
+}
+.jv-confirm-icon {
+	flex: none;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 32px;
+	height: 32px;
+	border-radius: 9px;
+	background: var(--red-bg);
+	border: 1px solid var(--red-bd);
+	color: var(--red);
+}
+.jv-confirm-title {
+	margin: 0;
+	font-size: 15px;
+	font-weight: 650;
+	color: var(--text);
+}
+.jv-confirm-msg {
+	margin: 0 0 18px;
+	font-size: 13px;
+	line-height: 1.5;
+	color: var(--text-2);
+}
+.jv-confirm-actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+}
+</style>

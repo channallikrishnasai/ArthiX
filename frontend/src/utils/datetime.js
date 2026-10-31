@@ -1,0 +1,130 @@
+// Shared server-datetime rendering. Frappe returns naive datetime strings in
+// the SITE timezone; parsing them with new Date()/dayjs() treats them as
+// browser-local and shows future-tense "in N minutes" for any viewer whose
+// timezone differs from the site's. frappe-ui's dayjsLocal() parses in
+// setConfig("systemTimezone") (fed from get_chat_ui_settings.time_zone in
+// AppShell) and converts to the browser zone; without the config it falls
+// back to plain dayjs() - today's behavior.
+import { dayjsLocal, dayjs, getConfig } from "frappe-ui";
+
+export function timeAgo(d) {
+	return d ? dayjsLocal(String(d)).fromNow() : "";
+}
+
+export function exactDate(d) {
+	return d ? dayjsLocal(String(d)).format("ddd, MMM D, YYYY h:mm A") : "";
+}
+
+export function formatDate(d, fmt) {
+	return d ? dayjsLocal(String(d)).format(fmt || "MMM D, YYYY") : "";
+}
+
+// A browser epoch (a row's local stamp before the server copy arrives) in the
+// same zone and format formatDate gives a server datetime, so the text does not
+// change when the server copy replaces the row.
+export function formatLocalMs(ms, fmt) {
+	return ms ? dayjs(ms).format(fmt || "MMM D, YYYY") : "";
+}
+
+// Epoch ms for a naive site-tz datetime string (SLA deadlines, creation), tz-aware
+// via dayjsLocal — so the duration/ordering math in lib/supportSla is correct for
+// any viewer's timezone, not just the site's. null for empty/invalid input.
+export function toLocalMs(d) {
+	if (d == null || d === "") return null;
+	// dayjsLocal -> dayjs.tz() THROWS RangeError on an unparseable string (before
+	// isValid() can catch it), so a single bad datetime would crash the caller's
+	// render (the SLA panel). Guard it and treat any failure as "no value".
+	try {
+		const dj = dayjsLocal(String(d));
+		return dj && typeof dj.isValid === "function" && dj.isValid() ? dj.valueOf() : null;
+	} catch {
+		return null;
+	}
+}
+
+// The send-side mirror of dayjsLocal: a browser-local datetime (an
+// <input type="datetime-local"> value, "YYYY-MM-DDTHH:mm") → the naive
+// site-timezone "YYYY-MM-DD HH:mm:ss" string Frappe endpoints expect.
+// frappe-ui 0.1.278 defines dayjsSystem but does NOT export it from its
+// index, so the two-hop tz conversion is replicated here with the exported
+// `dayjs` (tz plugin already extended) + `getConfig`. Without the
+// systemTimezone config it degrades to a plain reformat - today's dayjsLocal
+// fallback behavior.
+export function toSiteDatetime(d) {
+	if (!d) return "";
+	const s = String(d).replace("T", " ");
+	const site = getConfig("systemTimezone");
+	if (!site) return dayjs(s).format("YYYY-MM-DD HH:mm:ss");
+	const local = getConfig("localTimezone") || Intl.DateTimeFormat().resolvedOptions().timeZone;
+	return dayjs.tz(s, local).tz(site).format("YYYY-MM-DD HH:mm:ss");
+}
+
+// The site's timezone name ("Asia/Kolkata"), or "" when the shell has not been
+// told (AppShell feeds it from window.time_zone / get_chat_ui_settings). A stored
+// time-of-day such as a schedule's "09:00" is a SITE-zone clock time and is shown
+// as stored, never converted, so the text beside it has to say whose clock it is:
+// a viewer in another zone otherwise reads it as their own.
+export function siteTimezone() {
+	try {
+		return String(getConfig("systemTimezone") || "");
+	} catch {
+		return "";
+	}
+}
+
+// Whether a server datetime reads differently on the viewer's clock than as
+// stored (the site's clock). Judged by what is shown, not by zone names: one
+// clock under two names (Asia/Kolkata, Asia/Calcutta) is not a difference, and
+// two zones that happen to agree at that moment need no label either. False when
+// there is nothing to compare.
+export function onAnotherClock(d) {
+	if (!d) return false;
+	try {
+		const stored = String(d).replace("T", " ").slice(0, 19);
+		const shown = dayjsLocal(String(d)).format("YYYY-MM-DD HH:mm:ss");
+		return !!shown && shown !== stored;
+	} catch {
+		return false;
+	}
+}
+
+// "09:00" / "09:00:00" -> "9:00 am": the same text frappe-ui's TimePicker shows
+// for the value (use12Hour default), so a time reads the same on the form that
+// sets it and everywhere that reports it. "" for anything that is not a time.
+export function formatTime12h(hhmm) {
+	const m = /^(\d{1,2}):(\d{2})/.exec(String(hhmm || ""));
+	if (!m) return "";
+	const h = parseInt(m[1], 10);
+	const am = h < 12;
+	const h12 = h % 12 === 0 ? 12 : h % 12;
+	return `${h12}:${m[2]} ${am ? "am" : "pm"}`;
+}
+
+// Day-bucket label for chat day separators, timezone-safe like the rest of this
+// module. Accepts a naive site-tz string (creation/modified) or a browser Date /
+// ms number (optimistic rows). "Today" / "Yesterday" / weekday within a week /
+// "D MMMM" beyond.
+export function dayLabel(d) {
+	if (d == null || d === "") return "";
+	const dj = dayjsLocal(d);
+	if (!dj || typeof dj.isValid !== "function" || !dj.isValid()) return "";
+	const diff = dayjsLocal().startOf("day").diff(dj.startOf("day"), "day");
+	if (diff === 0) return "Today";
+	if (diff === 1) return "Yesterday";
+	if (diff > 1 && diff < 7) return dj.format("dddd");
+	return dj.format("D MMMM");
+}
+
+// A ticking elapsed-time label (jarvis#1062 C2/C3's running-run progress
+// display) - mm:ss under an hour, h:mm at/above it. Pure (no dayjs - the
+// caller supplies whole seconds, typically from toLocalMs(started_at)).
+// Negative/NaN input clamps to 0 (a clock started just before the caller's
+// first tick must never print a negative duration).
+export function fmtElapsed(totalSeconds) {
+	const sec = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+	const h = Math.floor(sec / 3600);
+	const m = Math.floor((sec % 3600) / 60);
+	const s = sec % 60;
+	const pad = (n) => String(n).padStart(2, "0");
+	return h > 0 ? `${h}:${pad(m)}` : `${pad(m)}:${pad(s)}`;
+}

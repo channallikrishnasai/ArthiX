@@ -1,0 +1,188 @@
+{
+  "doctype": "DocType",
+  "name": "Jarvis Custom Skill",
+  "module": "Jarvis",
+  "issingle": 0,
+  "custom": 0,
+  "engine": "InnoDB",
+  "autoname": "hash",
+  "field_order": [
+    "skill_name",
+    "enabled",
+    "user_invocable",
+    "allow_approve_run",
+    "admin_hold",
+    "admin_hold_reason",
+    "use_in_file_box",
+    "file_box_creates",
+    "scope",
+    "target_role",
+    "description",
+    "instructions",
+    "shared_with",
+    "allowed_roles",
+    "managed_by_learning",
+    "roles_derived",
+    "source_skill"
+  ],
+  "fields": [
+    {
+      "fieldname": "skill_name",
+      "fieldtype": "Data",
+      "label": "Skill Name",
+      "reqd": 1,
+      "in_list_view": 1,
+      "description": "Short slug: lowercase letters, digits and hyphens (3-40 chars). Shown to the user without the internal 'custom-' prefix."
+    },
+    {
+      "fieldname": "enabled",
+      "fieldtype": "Check",
+      "label": "Enabled",
+      "default": "1",
+      "in_list_view": 1,
+      "description": "When off, the skill is kept as a draft and NOT pushed to the assistant on Apply."
+    },
+    {
+      "fieldname": "user_invocable",
+      "fieldtype": "Check",
+      "label": "User Invocable",
+      "default": "1",
+      "description": "When on, the skill can be triggered explicitly from the chat composer with a '/' command."
+    },
+    {
+      "fieldname": "allow_approve_run",
+      "fieldtype": "Check",
+      "label": "Allow Approve & run",
+      "default": "0",
+      "in_list_view": 1,
+      "in_standard_filter": 1,
+      "description": "ADMIN ONLY. When on, a declared 2+-step plan run of this skill offers 'Approve & run': one approval opens an uncarded run of the explicit _SKILL_AUTORUN_COVERED allowlist (create_doc/update_doc/submit_doc/run_import/apply_workflow_action/send_email/share_doc/assign_to/update_wiki/run_method) until the run ends; the destructive trio (delete/cancel/amend) and create_custom_skill always still park. Enabling requires the Jarvis Admin / System Manager role; disabling is free for the owner - the toggle IS the kill switch (un-arm = instant off, no deploy)."
+    },
+    {
+      "fieldname": "admin_hold",
+      "fieldtype": "Check",
+      "label": "On hold (admin)",
+      "default": "0",
+      "read_only": 1,
+      "no_copy": 1,
+      "permlevel": 1,
+      "description": "Set and cleared by a Jarvis Admin from the Admin tab of the Skills page, never by the owner. While on, the skill is off and disarmed, is not served to the assistant, cannot be promoted, and cannot be switched back on or armed."
+    },
+    {
+      "fieldname": "admin_hold_reason",
+      "fieldtype": "Small Text",
+      "label": "Hold reason",
+      "read_only": 1,
+      "hidden": 1,
+      "no_copy": 1,
+      "permlevel": 1,
+      "description": "Why the admin put the skill on hold, shown to its owner in the Skills page. Hidden in Desk: the text is stored as the admin typed it, and the Desk form would show it as HTML. The SPA shows it as plain text."
+    },
+    {
+      "fieldname": "use_in_file_box",
+      "fieldtype": "Check",
+      "label": "Use in File Box",
+      "default": "1",
+      "description": "When on, File Box may follow this skill automatically for a dropped document (your own skills, and reviewed Role/Org skills your roles admit). Untick to keep it out of automatic File Box processing; an explicit pin at drop still needs it on. Turning it back on for a Role/Org skill needs a reviewer."
+    },
+    {
+      "fieldname": "file_box_creates",
+      "fieldtype": "Link",
+      "label": "File Box creates",
+      "options": "DocType",
+      "description": "The document type a File Box run following this skill must draft (e.g. Purchase Invoice); the document's printed title never changes it. Must be a submittable document type."
+    },
+    {
+      "fieldname": "scope",
+      "fieldtype": "Select",
+      "label": "Scope",
+      "options": "User\nRole\nOrg",
+      "default": "User",
+      "description": "Scope ladder (security review PART 2 TASK 10, mirrors Jarvis Wiki Page). User = private to the owner (default; reached via jarvis__find_skills / jarvis__get_skill, never pushed to the shared catalog). Role = holders of Target Role. Org = everyone; joins the shared assistant catalog on Apply. Widening (User->Role->Org) is reviewer-approved only. Empty (pre-migration rows) means Org."
+    },
+    {
+      "fieldname": "target_role",
+      "fieldtype": "Link",
+      "label": "Target Role",
+      "options": "Role",
+      "depends_on": "eval:doc.scope=='Role'",
+      "mandatory_depends_on": "eval:doc.scope=='Role'",
+      "description": "Required for Role-scope skills: the single role whose holders may see/invoke this skill (the Wiki-parallel audience field)."
+    },
+    {
+      "fieldname": "description",
+      "fieldtype": "Small Text",
+      "label": "Description",
+      "reqd": 1,
+      "in_list_view": 1,
+      "description": "One-line summary of when to use this skill (becomes the SKILL.md frontmatter description)."
+    },
+    {
+      "fieldname": "instructions",
+      "fieldtype": "Long Text",
+      "label": "Instructions (Markdown)",
+      "reqd": 1,
+      "description": "Markdown body of the SKILL.md: what the assistant should do when this skill is used."
+    },
+    {
+      "fieldname": "shared_with",
+      "fieldtype": "Table",
+      "label": "Shared With",
+      "options": "Jarvis Custom Skill Share",
+      "description": "Users this skill is shared with (read-only for them; only the owner can edit or re-share)."
+    },
+    {
+      "fieldname": "allowed_roles",
+      "fieldtype": "Table",
+      "label": "Allowed Roles",
+      "options": "Jarvis Custom Skill Allowed Role",
+      "description": "Empty = visible to everyone. Otherwise only the owner, shared-with users and holders of one of these roles (System Manager always passes) see/invoke the skill."
+    },
+    {
+      "fieldname": "managed_by_learning",
+      "fieldtype": "Check",
+      "label": "Managed by Learning",
+      "default": "0",
+      "hidden": 1,
+      "description": "Marker only: this row is a consolidated learned-<domain> skill compiled from approved learned patterns; the learning board is its management surface."
+    },
+    {
+      "fieldname": "roles_derived",
+      "fieldtype": "Check",
+      "label": "Roles Derived",
+      "default": "0",
+      "read_only": 1,
+      "hidden": 1,
+      "description": "Provenance for allowed_roles on a compiler-managed row (issue #479): 1 means the role derivation ran to a conclusion for every source doctype, so an EMPTY allowed_roles genuinely means no desk role narrows this skill. 0 means the derivation could not be completed and the empty set is a fallback, not a finding. Recorded only - no code reads it, and an empty allowed_roles still means everyone."
+    },
+    {
+      "fieldname": "source_skill",
+      "fieldtype": "Data",
+      "label": "Source Skill",
+      "read_only": 1,
+      "hidden": 1,
+      "search_index": 1,
+      "description": "Lineage marker (R2-SP-3): for a system-owned shared copy materialized by a reviewer-approved promotion, the docname of the requester's private source skill it was promoted FROM. A later higher-scope approval of the SAME source supersedes this copy in place (User->Role then User->Org yields one shared copy at Org, no orphan). Plain Data (not a Link) so deleting the private source never blocks on it."
+    }
+  ],
+  "permissions": [
+    {
+      "role": "Jarvis User",
+      "read": 1,
+      "write": 1,
+      "create": 1,
+      "delete": 1
+    },
+    {
+      "role": "System Manager",
+      "read": 1,
+      "write": 1,
+      "create": 1,
+      "delete": 1
+    }
+  ],
+  "sort_field": "skill_name",
+  "sort_order": "ASC",
+  "track_changes": 1,
+  "modified": "2026-10-14 20:00:00.000000"
+}

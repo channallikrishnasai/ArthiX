@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 280" role="img" aria-labelledby="title desc">
+  <title id="title">A reviewed ERP automation flow</title>
+  <desc id="desc">Source documents become evidence, a person reviews proposed work, approved changes reach ERPNext, and the workflow can be reused.</desc>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1">
+      <stop stop-color="#071326"/>
+      <stop offset="1" stop-color="#111c3b"/>
+    </linearGradient>
+    <linearGradient id="glass" x2="0.9" y2="1">
+      <stop stop-color="#d9f2ff" stop-opacity=".2"/>
+      <stop offset="1" stop-color="#91aaff" stop-opacity=".06"/>
+    </linearGradient>
+    <linearGradient id="line" x2="1">
+      <stop stop-color="#43d5df"/>
+      <stop offset=".52" stop-color="#9d8cff"/>
+      <stop offset="1" stop-color="#ffc879"/>
+    </linearGradient>
+    <filter id="glow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="180%">
+      <feDropShadow dx="0" dy="9" stdDeviation="8" flood-color="#020817" flood-opacity=".6"/>
+    </filter>
+    <path id="route" d="M128 139H912"/>
+  </defs>
+  <rect width="1040" height="280" rx="26" fill="url(#bg)"/>
+  <path d="M54 203C206 255 340 223 482 235S795 249 986 192" fill="none" stroke="#6885ce" stroke-opacity=".12" stroke-width="1"/>
+  <path d="M54 73C206 21 340 53 482 41S795 27 986 84" fill="none" stroke="#6885ce" stroke-opacity=".12" stroke-width="1"/>
+  <use href="#route" fill="none" stroke="#6b7ca8" stroke-opacity=".3" stroke-width="2" stroke-dasharray="4 10"/>
+  <use href="#route" fill="none" stroke="url(#line)" stroke-opacity=".24" stroke-width="2" stroke-dasharray="2 24">
+    <animate attributeName="stroke-dashoffset" from="0" to="-104" dur="5s" repeatCount="indefinite"/>
+  </use>
+
+  <g font-family="Inter, ui-sans-serif, system-ui, sans-serif" text-anchor="middle">
+    <g transform="translate(128 139)" filter="url(#shadow)">
+      <ellipse cy="27" rx="57" ry="13" fill="#27c5d4" fill-opacity=".14"/>
+      <rect x="-39" y="-39" width="78" height="78" rx="22" fill="url(#glass)" stroke="#86d9f4" stroke-opacity=".7"/>
+      <path d="M-18-10h36v31h-36zM-12-19h24v9h-24zM-10-1h20M-10 7h20M-10 15h13" fill="none" stroke="#a9e8f2" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="25" cy="-22" r="5" fill="#53dce5" filter="url(#glow)"/>
+      <text y="76" fill="#f1f5ff" font-size="15" font-weight="650">Source</text>
+      <text y="96" fill="#a7b5d3" font-size="12">documents &amp; records</text>
+    </g>
+    <g transform="translate(324 139)" filter="url(#shadow)">
+      <ellipse cy="27" rx="57" ry="13" fill="#5388ff" fill-opacity=".15"/>
+      <rect x="-39" y="-39" width="78" height="78" rx="22" fill="url(#glass)" stroke="#9bb6ff" stroke-opacity=".7"/>
+      <path d="M-18-18h36v12h-36zM-18 2h22v12h-22zM10 2h8v12h-8zM-18 22h36" fill="none" stroke="#b6c9ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="24" cy="-23" r="5" fill="#7e9dff" filter="url(#glow)"/>
+      <text y="76" fill="#f1f5ff" font-size="15" font-weight="650">Evidence</text>
+      <text y="96" fill="#a7b5d3" font-size="12">grounded proposal</text>
+    </g>
+    <g transform="translate(520 139)" filter="url(#shadow)">
+      <ellipse cy="27" rx="63" ry="15" fill="#ad8cff" fill-opacity=".2"/>
+      <rect x="-43" y="-43" width="86" height="86" rx="25" fill="url(#glass)" stroke="#c2adff" stroke-opacity=".85"/>
+      <path d="M-18 1l12 12 25-28" fill="none" stroke="#dfd3ff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle r="53" fill="none" stroke="#a98cff" stroke-opacity=".25">
+        <animate attributeName="r" values="48;60;48" dur="3s" repeatCount="indefinite"/>
+        <animate attributeName="stroke-opacity" values=".35;.04;.35" dur="3s" repeatCount="indefinite"/>
+      </circle>
+      <text y="80" fill="#f1f5ff" font-size="15" font-weight="650">Human review</text>
+      <text y="100" fill="#c2b5ec" font-size="12">approve or revise</text>
+    </g>
+    <g transform="translate(716 139)" filter="url(#shadow)">
+      <ellipse cy="27" rx="57" ry="13" fill="#ffc879" fill-opacity=".15"/>
+      <rect x="-39" y="-39" width="78" height="78" rx="22" fill="url(#glass)" stroke="#ffd08c" stroke-opacity=".7"/>
+      <path d="M-18 4h8l6-14 10 26 6-12h8" fill="none" stroke="#ffe1b2" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="24" cy="-23" r="5" fill="#ffc879" filter="url(#glow)"/>
+      <text y="76" fill="#f1f5ff" font-size="15" font-weight="650">ERPNext</text>
+      <text y="96" fill="#a7b5d3" font-size="12">permission-checked action</text>
+    </g>
+    <g transform="translate(912 139)" filter="url(#shadow)">
+      <ellipse cy="27" rx="57" ry="13" fill="#59d9b0" fill-opacity=".13"/>
+      <rect x="-39" y="-39" width="78" height="78" rx="22" fill="url(#glass)" stroke="#81e2bd" stroke-opacity=".7"/>
+      <path d="M-17 1l11 11 23-25M-18 23h36" fill="none" stroke="#aaf1d0" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="24" cy="-23" r="5" fill="#59d9b0" filter="url(#glow)"/>
+      <text y="76" fill="#f1f5ff" font-size="15" font-weight="650">Reuse</text>
+      <text y="96" fill="#a7b5d3" font-size="12">skills, macros &amp; triggers</text>
+    </g>
+  </g>
+
+  <circle r="4" fill="#effcff" filter="url(#glow)">
+    <animateMotion dur="4.8s" repeatCount="indefinite" rotate="auto"><mpath href="#route"/></animateMotion>
+  </circle>
+  <circle r="3" fill="#cbbaff" filter="url(#glow)">
+    <animateMotion dur="4.8s" begin="-1.6s" repeatCount="indefinite" rotate="auto"><mpath href="#route"/></animateMotion>
+  </circle>
+  <circle r="3.5" fill="#ffe1b2" filter="url(#glow)">
+    <animateMotion dur="4.8s" begin="-3.2s" repeatCount="indefinite" rotate="auto"><mpath href="#route"/></animateMotion>
+  </circle>
+</svg>

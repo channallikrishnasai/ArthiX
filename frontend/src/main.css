@@ -1,0 +1,239 @@
+/* Global styles lifted from the imported design (Jarvis Chat.dc.html). */
+
+/* ===== Brand tokens =========================================================
+   The single source of truth for the Jarvis mark's colour.
+
+   Deliberately on :root and NOT in theme.js's paletteVars: jv-* vars only
+   resolve inside a subtree that bound paletteVars (the chat/settings/onboarding
+   roots), but the mark also renders in the frappe-ui shell — the sidebar
+   (UserMenu) and the global toaster — where those vars do not exist. :root
+   reaches both worlds.
+
+   Theme-invariant on purpose: the brand does not flip. Every other colour in
+   the app does, which is precisely how the mark drifted into three different
+   colours — chips painted `var(--cta)` went near-black in light and near-white
+   in dark, so a dark-mode-only !important rule had to force the gradient back. */
+:root {
+	--brand-1: #6e8bff;
+	--brand-2: #8b5cf6;
+	--brand-grad: linear-gradient(135deg, var(--brand-1), var(--brand-2));
+
+	/* App-wide keyboard-focus ring colour. On :root (not theme.js paletteVars) so
+	   it resolves on every surface, including plain pages and teleported dialogs
+	   that never bound paletteVars, same reason --brand-* live here. Near-black,
+	   matching the --cta focus idiom the app already uses on chat and onboarding. */
+	--focus-ring: #1c1c22;
+
+	/* Money green, for the banknotes in the payment-confirming illustration
+	   ONLY (PaymentConfirmingArt.vue).
+
+	   Deliberately NOT the semantic success ramp. --green (#16a34a) means
+	   success/paid, and this illustration renders while the payment is still
+	   UNCONFIRMED - the whole point of that screen is that we do not have a
+	   verdict yet. Painting it in the success colour would assert the payment
+	   succeeded before it has, which is the same class of false progress
+	   jarvis#708/#709 were about. It reads as money, it does not read as a
+	   green tick.
+
+	   Unlike the brand pair above these DO flip by theme, because a fill dark
+	   enough to sit on a white card disappears on a near-black one. Written as
+	   a :root default plus a [data-theme="dark"] override rather than in
+	   theme.js's paletteVars, so they resolve everywhere - the jv-* vars only
+	   resolve inside a subtree that bound paletteVars, and applyTheme() already
+	   stamps data-theme on <html>.
+
+	   Never use them for text, badges, banners or any control. */
+	--money-note: #1f8a54;
+	--money-note-bd: #34a76a;
+}
+
+[data-theme="dark"] {
+	/* Focus ring inverts to near-white so it stays visible on the dark UI,
+	   matching --cta's dark value. */
+	--focus-ring: #ececf0;
+	/* Lifted for legibility on the dark card; the border stays a touch lighter
+	   than the fill so the note keeps its edge. */
+	--money-note: #4fbf85;
+	--money-note-bd: #6fce9a;
+}
+
+/* Native form controls (select dropdowns, date/time pickers, scrollbars)
+   follow the app theme instead of the OS default — without this, a dark app
+   pops white select menus and calendar popups. Global (not scoped to
+   ChatView) because `.jv-root` is also the palette-vars root for the
+   settings dialog, onboarding, and (PR2) the standalone Support page. */
+.jv-root {
+	color-scheme: light;
+}
+.jv-root.jv-dark {
+	color-scheme: dark;
+}
+
+* {
+	box-sizing: border-box;
+}
+html,
+body {
+	margin: 0;
+	padding: 0;
+}
+#app {
+	height: 100vh;
+}
+body {
+	font-family: "Inter", system-ui, -apple-system, sans-serif;
+	-webkit-font-smoothing: antialiased;
+}
+::-webkit-scrollbar {
+	width: 9px;
+	height: 9px;
+}
+::-webkit-scrollbar-thumb {
+	background: #d6d6dc;
+	border-radius: 8px;
+	border: 2px solid transparent;
+	background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+	background: #c2c2ca;
+	background-clip: padding-box;
+	border: 2px solid transparent;
+}
+::-webkit-scrollbar-track {
+	background: transparent;
+}
+/* dark-mode scrollbar (the light thumb was hardcoded) */
+:root[data-theme="dark"] ::-webkit-scrollbar-thumb {
+	background-color: #3a3a45;
+}
+:root[data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
+	background-color: #4a4a55;
+}
+/* Overlay scrollbar primitive for popovers/dropdowns: applied by the
+   `v-scroll-fade` directive (composables/useScrollFade.js), which toggles
+   `.is-scrolling` on scroll and removes it ~800ms after scrolling stops.
+   Invisible at rest, revealed only while actively scrolling, matching the
+   macOS overlay style rather than a permanent track. Opt-in via this class
+   so it doesn't widen the global ::-webkit-scrollbar rule above to every
+   scroll surface in the app. */
+.jv-scroll-fade {
+	scrollbar-width: thin;
+	scrollbar-color: transparent transparent;
+}
+.jv-scroll-fade.is-scrolling {
+	scrollbar-color: #d6d6dc transparent;
+}
+.jv-scroll-fade::-webkit-scrollbar {
+	width: 7px;
+	height: 7px;
+}
+.jv-scroll-fade::-webkit-scrollbar-thumb {
+	background-color: transparent;
+	border-radius: 8px;
+	border: 2px solid transparent;
+	background-clip: padding-box;
+	transition: background-color 0.2s ease;
+}
+.jv-scroll-fade.is-scrolling::-webkit-scrollbar-thumb {
+	background-color: #d6d6dc;
+	background-clip: padding-box;
+}
+.jv-scroll-fade::-webkit-scrollbar-thumb:hover {
+	background-color: #c2c2ca;
+	background-clip: padding-box;
+}
+:root[data-theme="dark"] .jv-scroll-fade.is-scrolling {
+	scrollbar-color: #3a3a45 transparent;
+}
+:root[data-theme="dark"] .jv-scroll-fade.is-scrolling::-webkit-scrollbar-thumb {
+	background-color: #3a3a45;
+}
+:root[data-theme="dark"] .jv-scroll-fade::-webkit-scrollbar-thumb:hover {
+	background-color: #4a4a55;
+}
+@keyframes jv-fade {
+	from { opacity: 0; transform: translateY(6px); }
+	to { opacity: 1; transform: translateY(0); }
+}
+@keyframes jv-pulse {
+	0% { box-shadow: 0 0 0 0 rgba(79, 70, 229, 0.35); }
+	70% { box-shadow: 0 0 0 12px rgba(79, 70, 229, 0); }
+	100% { box-shadow: 0 0 0 0 rgba(79, 70, 229, 0); }
+}
+@keyframes jv-pop {
+	from { opacity: 0; transform: translateY(12px) scale(0.98); }
+	to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes jv-grow {
+	from { transform: scaleY(0); }
+	to { transform: scaleY(1); }
+}
+
+/* frappe-ui Dialog renders through DialogPortal into <body> with no z-index of
+   its own. #app is only `height: 100vh` so it creates no stacking context,
+   which means Sidebar.vue's z-10 / z-20 layers would paint straight over a
+   portaled dialog. 60 clears those (it is the value the old hand-rolled
+   .jv-settings-overlay used) and stays below the shell ConfirmDialog's 200,
+   which is what lets a confirm still open on top of the settings dialog.
+
+   Deliberately app-wide rather than scoped to the settings dialog: every
+   frappe-ui Dialog here (command palette, ConnectPhoneDialog, WikiPageDialog,
+   FilePreview) portals the same way and is equally
+   paintable-over by the sidebar today, so one floor for portaled modals is the
+   right fix. Anything that must sit ABOVE a modal already carries a higher
+   z-index (ConfirmDialog 200, toasts above that). */
+.dialog-overlay {
+	z-index: 60;
+}
+
+/* …and the other half of that story. frappe-ui's Popover renders its content
+   through reka-ui's PopoverPortal into <body> as well, but carries NO z-index at
+   all (.PopoverContent is unstyled for stacking). So once the floor above lifted
+   dialogs to 60, every picker OPENED FROM INSIDE a dialog was painted over by the
+   dialog it belongs to — the role Autocomplete in "Request promotion" looked like
+   a dead control: clicking it opened a list nobody could see.
+
+   120 clears every overlay in the app (dialog 60, DraftPreview 61, skills 62, and
+   ChatView's 70/90 chat layers) while staying below ConfirmDialog's 200, so a
+   confirm still opens over an open picker. App-wide for the same reason the rule
+   above is: every Autocomplete/Dropdown/Select portals identically. */
+.PopoverContent {
+	z-index: 120;
+}
+
+/* jarvis#653: frappe-ui's FormControl type="select" (reka-ui's SelectContent
+   under the hood) sets NO height cap on its popover. With few options that is
+   invisible; the Schedule section's monthly Day control (1st..31st, 31 rows)
+   grew the popover past the bottom of the viewport with no way to reach the
+   later rows - page scroll does not move a portaled popover, and there was
+   no internal scrollbar to scroll instead.
+
+   [data-slot="content-body"] is the wrapper div Select renders (see its own
+   scoped <style> block below), but Combobox and MultiSelect ALSO render an
+   element with that same data-slot, and both already cap their own inner
+   viewport (max-h-60/overflow-auto in ComboboxResults.vue) plus carry a
+   search input. A first version of this rule matched all three: on a short
+   viewport (about 500px, where 40vh is only 200px) that produced two nested
+   scroll regions, with Combobox/MultiSelect's search input scrolling away
+   independently of its own results below it.
+
+   The selector below scopes to Select ONLY. reka-ui's SelectContentImpl sets
+   role="listbox" on the popover's own outer element (an ANCESTOR of
+   [data-slot="content-body"], not the element itself - see
+   reka-ui/src/Select/SelectContentImpl.vue); neither ComboboxContentImpl nor
+   MultiSelect (built on the same ComboboxContent) ever sets that role
+   anywhere in their DOM. Verified by reading both trees in node_modules
+   rather than assumed - `role="listbox"` does not appear once in
+   reka-ui/src/Combobox/ or frappe-ui/src/components/MultiSelect/.
+
+   overflow-y is !important because Select's own class list already carries
+   `overflow-hidden` (Tailwind, same specificity as this attribute selector)
+   and load order between the two stylesheets is not something to rely on.
+
+   App-wide for the same reason as the two rules above: every plain Select in
+   the app (not just this one page) portals identically and none of them
+   wants an unreachable tail once its option list is long enough. */
+[role="listbox"] [data-slot="content-body"] {
+	max-height: 40vh;
+	overflow-y: auto !important;
+}

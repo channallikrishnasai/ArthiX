@@ -1,0 +1,171 @@
+"""Tests for jarvis.chat.events - agent event parsing + realtime publish wrapper."""
+
+from unittest.mock import patch
+
+from frappe.tests.utils import FrappeTestCase
+
+from jarvis.chat.events import parse_event, publish_to_user
+
+
+class TestParseEvent(FrappeTestCase):
+	def test_lifecycle_start(self):
+		ev = parse_event({"stream": "lifecycle", "data": {"phase": "start"}})
+		self.assertEqual(ev["kind"], "lifecycle")
+		self.assertEqual(ev["phase"], "start")
+
+	def test_lifecycle_end(self):
+		ev = parse_event({"stream": "lifecycle", "data": {"phase": "end"}})
+		self.assertEqual(ev["kind"], "lifecycle")
+		self.assertEqual(ev["phase"], "end")
+
+	def test_lifecycle_error(self):
+		ev = parse_event({"stream": "lifecycle", "data": {"phase": "error", "error": "x"}})
+		self.assertEqual(ev["kind"], "lifecycle")
+		self.assertEqual(ev["phase"], "error")
+		self.assertEqual(ev["error"], "x")
+
+	def test_tool_start(self):
+		ev = parse_event(
+			{
+				"stream": "item",
+				"data": {
+					"kind": "tool",
+					"phase": "start",
+					"name": "jarvis__get_list",
+					"toolCallId": "tc-1",
+				},
+			}
+		)
+		self.assertEqual(ev["kind"], "tool")
+		self.assertEqual(ev["phase"], "start")
+		self.assertEqual(ev["tool_name"], "jarvis__get_list")
+		self.assertEqual(ev["tool_call_id"], "tc-1")
+
+	def test_tool_end(self):
+		ev = parse_event(
+			{
+				"stream": "item",
+				"data": {
+					"kind": "tool",
+					"phase": "end",
+					"name": "jarvis__get_list",
+					"toolCallId": "tc-1",
+					"status": "completed",
+				},
+			}
+		)
+		self.assertEqual(ev["kind"], "tool")
+		self.assertEqual(ev["phase"], "end")
+		self.assertEqual(ev["status"], "completed")
+
+	def test_assistant_delta(self):
+		ev = parse_event(
+			{
+				"stream": "assistant",
+				"data": {"text": "Hello world", "delta": " world"},
+			}
+		)
+		self.assertEqual(ev["kind"], "assistant")
+		self.assertEqual(ev["text"], "Hello world")
+		self.assertEqual(ev["delta"], " world")
+
+	def test_item_non_tool_returns_none(self):
+		ev = parse_event({"stream": "item", "data": {"kind": "thinking"}})
+		self.assertIsNone(ev)
+
+	def test_codex_preamble_becomes_a_step(self):
+		ev = parse_event(
+			{
+				"stream": "item",
+				"data": {
+					"kind": "preamble",
+					"phase": "update",
+					"itemId": "msg_1",
+					"progressText": "Checking the overdue invoices",
+					"source": "codex-app-server",
+				},
+			}
+		)
+		self.assertEqual(ev, {"kind": "step", "text": "Checking the overdue invoices"})
+
+	def test_step_text_is_redacted(self):
+		with patch("jarvis.chat.events.egress_rules.redact", side_effect=lambda s: s.upper()):
+			ev = parse_event({"stream": "item", "data": {"kind": "preamble", "progressText": "checking"}})
+		self.assertEqual(ev["text"], "CHECKING")
+
+	def test_tool_stream_start_is_a_tool_boundary(self):
+		ev = parse_event({"stream": "tool", "data": {"phase": "start", "name": "Bash", "toolCallId": "t1"}})
+		self.assertEqual(ev, {"kind": "tool_boundary"})
+		self.assertIsNone(parse_event({"stream": "tool", "data": {"phase": "result", "toolCallId": "t1"}}))
+
+	def test_empty_preamble_and_answer_candidate_are_dropped(self):
+		self.assertIsNone(parse_event({"stream": "item", "data": {"kind": "preamble", "progressText": "  "}}))
+		self.assertIsNone(
+			parse_event({"stream": "item", "data": {"kind": "answer_candidate", "progressText": "Answer"}})
+		)
+
+	def test_unknown_stream_returns_none(self):
+		ev = parse_event({"stream": "heartbeat", "data": {}})
+		self.assertIsNone(ev)
+
+	def test_empty_stream_returns_none(self):
+		ev = parse_event({"stream": None, "data": {}})
+		self.assertIsNone(ev)
+
+	def test_assistant_with_non_dict_data_returns_empty_shape(self):
+		# A malformed frame where payload["data"] is a string (not a dict)
+		# must not raise inside the relay's never-raises generator - that
+		# would escape to the worker backstop as a false run:error.
+		ev = parse_event({"stream": "assistant", "data": "garbage"})
+		self.assertEqual(ev["kind"], "assistant")
+		self.assertEqual(ev["text"], "")
+		self.assertEqual(ev["delta"], "")
+
+	def test_lifecycle_with_none_data_returns_phase_none(self):
+		ev = parse_event({"stream": "lifecycle", "data": None})
+		self.assertEqual(ev["kind"], "lifecycle")
+		self.assertIsNone(ev["phase"])
+
+
+class TestPublishToUser(FrappeTestCase):
+	def test_publishes_to_jarvis_event_channel_scoped_to_user(self):
+		with patch("frappe.publish_realtime") as mock_pub:
+			publish_to_user("alice@example.com", {"kind": "run:start"})
+		mock_pub.assert_called_once_with(
+			"jarvis:event",
+			{"kind": "run:start"},
+			user="alice@example.com",
+		)
+
+	def test_dashboard_terminal_carries_durable_origin(self):
+		payload = {"kind": "run:end", "conversation_id": "conv-dashboard"}
+		with (
+			patch("frappe.db.get_value", return_value="dashboards") as get_origin,
+			patch("frappe.publish_realtime") as mock_pub,
+		):
+			publish_to_user("alice@example.com", payload)
+
+		get_origin.assert_called_once_with("Jarvis Conversation", "conv-dashboard", "origin_page")
+		mock_pub.assert_called_once_with(
+			"jarvis:event",
+			{
+				"kind": "run:end",
+				"conversation_id": "conv-dashboard",
+				"origin_page": "dashboards",
+			},
+			user="alice@example.com",
+		)
+		# The wrapper must not mutate a caller-owned dict that may be reused.
+		self.assertNotIn("origin_page", payload)
+
+	def test_streaming_events_do_not_pay_an_origin_lookup(self):
+		with (
+			patch("frappe.db.get_value") as get_origin,
+			patch("frappe.publish_realtime") as mock_pub,
+		):
+			publish_to_user(
+				"alice@example.com",
+				{"kind": "assistant:delta", "conversation_id": "conv-dashboard"},
+			)
+		get_origin.assert_not_called()
+		mock_pub.assert_called_once()

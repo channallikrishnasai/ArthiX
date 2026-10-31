@@ -1,0 +1,917 @@
+<template>
+	<div class="mx-auto w-full max-w-3xl px-6 py-6">
+		<!-- run header. jarvis#1062 P2-12 (production-readiness audit):
+		     flex-wrap - the status badge + up to 3 action buttons had nowhere
+		     to go on a narrow screen except squeeze the title down to
+		     nothing; they now wrap to their own line instead, title kept
+		     full-width and truncating on its own line above them. -->
+		<div class="flex flex-wrap items-center gap-3">
+			<h2 class="min-w-0 flex-1 truncate text-lg font-semibold text-ink-gray-9">
+				Run {{ runLabel }}
+			</h2>
+			<Badge
+				variant="subtle"
+				:theme="STATUS_THEME[run.status] || 'gray'"
+				:label="run.status"
+			/>
+			<Button
+				v-if="run.dashboard"
+				variant="subtle"
+				label="Open dashboard"
+				iconLeft="bar-chart-2"
+				@click="router.push('/dashboards/' + run.dashboard)"
+			/>
+			<Button
+				v-if="run.conversation && run.status !== 'running'"
+				variant="subtle"
+				label="Open Chat"
+				iconLeft="message-circle"
+				@click="router.push('/c/' + run.conversation)"
+			/>
+			<!-- #1062 C2: no confirm dialog - stop is safe (soft) and idempotent
+			     server-side (a concurrent finish/second click just reports the
+			     terminal state it actually reached). -->
+			<Button
+				v-if="run.status === 'running'"
+				variant="subtle"
+				theme="red"
+				label="Stop"
+				iconLeft="square"
+				:loading="stopping"
+				@click="stopRun"
+			/>
+		</div>
+		<div class="mt-1 flex flex-wrap items-center gap-1.5 text-sm text-ink-gray-5">
+			<span>{{ run.trigger || "manual" }}</span>
+			<template v-if="run.started_at">
+				<span>·</span>
+				<Tooltip :text="exactDate(run.started_at)">
+					<span>started {{ timeAgo(run.started_at) }}</span>
+				</Tooltip>
+			</template>
+			<template v-if="run.finished_at">
+				<span>·</span>
+				<Tooltip :text="exactDate(run.finished_at)">
+					<span>finished {{ timeAgo(run.finished_at) }}</span>
+				</Tooltip>
+			</template>
+			<!-- T6: per-agent minimum model - blank on a legacy run. -->
+			<template v-if="modelInfo">
+				<span>·</span>
+				<span :class="modelInfo.warn ? 'text-ink-amber-3' : ''" :title="modelInfo.title">
+					Model: {{ modelInfo.label
+					}}<template v-if="modelInfo.note"> · {{ modelInfo.note }}</template>
+				</span>
+			</template>
+		</div>
+
+		<!-- Step timeline (jarvis#1062): the run's own narration, full width and
+		     directly under the header so it reads as part of the run, not as a
+		     placeholder inside an empty findings list. Deliberately OUTSIDE the
+		     scribe/auditor branches - both natures take the same steps - and kept
+		     after the run finishes (collapsed) so a completed run is inspectable. -->
+		<RunStepTimeline :steps="steps" :status="run.status" :elapsed="elapsedLabel" />
+
+		<!-- Scribe run: a Custom App Learning agent writes wiki pages, not findings.
+		     Show the pages it wrote (with links) instead of a findings list, so a
+		     successful run reads as "N pages written", never a failure / "0 findings". -->
+		<template v-if="isScribe">
+			<!-- x-circle, not Banner's fixed error icon: matches AgentActivityTab's own
+				 run_failed convention (icon: "x-circle"), which Banner has no prop to
+				 select. -->
+			<div
+				v-if="run.status === 'failed'"
+				class="mt-4 flex items-start gap-2 rounded-lg border border-outline-red-1 bg-surface-red-1 px-3 py-2 text-sm text-ink-red-4"
+			>
+				<FeatherIcon name="x-circle" class="size-4 shrink-0" />
+				<span>{{ run.error || "This run failed before writing any pages." }}</span>
+			</div>
+			<Banner
+				v-else-if="coverageWarning"
+				class="mt-4"
+				type="warning"
+				:message="`${coverageNote}.`"
+			>
+				<TechnicalDetails :details="coverageDetails" />
+			</Banner>
+
+			<div class="mt-5 text-base font-medium text-ink-gray-9">
+				{{ scribePages.length || run.pages_written || 0 }} wiki page{{
+					(scribePages.length || run.pages_written || 0) === 1 ? "" : "s"
+				}}
+				written
+			</div>
+			<div v-if="scribePages.length" class="mt-2 divide-y overflow-hidden rounded-lg border">
+				<a
+					v-for="p in scribePages"
+					:key="p.slug"
+					:href="wikiUrl(p.slug)"
+					target="_blank"
+					rel="noopener"
+					class="flex items-center gap-2 px-3 py-2.5 hover:bg-surface-gray-1"
+				>
+					<FeatherIcon name="book-open" class="size-4 shrink-0 text-ink-gray-5" />
+					<span class="min-w-0 flex-1 truncate text-base text-ink-gray-8">
+						{{ p.title || p.slug }}
+					</span>
+					<FeatherIcon name="external-link" class="size-3.5 shrink-0 text-ink-gray-5" />
+				</a>
+			</div>
+			<!-- the running state is the timeline above; this line only says where
+			     the pages will land -->
+			<div v-else-if="run.status === 'running'" class="mt-2 py-6 text-sm text-ink-gray-5">
+				Wiki pages appear here as they are written.
+			</div>
+			<div v-else class="mt-2 py-6 text-sm text-ink-gray-5">
+				No wiki pages were written this run.
+			</div>
+		</template>
+
+		<template v-else>
+			<!-- coverage-honesty banner: a coverage gap must NEVER read as all-clear. Copy
+			     is status-neutral ("Coverage gaps") because it fires on a data-gap run whose
+			     badge now reads "completed" as well as on an execution-partial run -->
+			<Banner
+				v-if="coverageWarning"
+				class="mt-4"
+				type="warning"
+				:message="`Coverage gaps - ${coverageNote}. Treat gaps as unreviewed, not clean.`"
+			>
+				<TechnicalDetails :details="coverageDetails" />
+			</Banner>
+
+			<!-- failed/stopped run: surface the error; no findings snapshot was
+				 recorded. x-circle, not Banner's fixed error icon: see the scribe
+				 branch above. -->
+			<div
+				v-if="run.status === 'failed' || (run.status === 'stopped' && run.error)"
+				class="mt-4 flex items-start gap-2 rounded-lg border border-outline-red-1 bg-surface-red-1 px-3 py-2 text-sm text-ink-red-4"
+			>
+				<FeatherIcon name="x-circle" class="size-4 shrink-0" />
+				<span>{{ run.error || "This run failed before recording findings." }}</span>
+			</div>
+
+			<!-- state-filter chips (all/open/acknowledged/resolved) -->
+			<div class="mt-5 flex flex-wrap items-center gap-2">
+				<Button
+					v-for="c in STATE_CHIPS"
+					:key="c.value"
+					:label="c.label"
+					:variant="stateFilter === c.value ? 'solid' : 'subtle'"
+					@click="stateFilter = c.value"
+				/>
+			</div>
+
+			<div v-if="loading && !rows.length" class="flex justify-center py-10">
+				<JvSpinner />
+			</div>
+			<!-- persistent fetch-error state: a failed load must never read as "No findings" -->
+			<div v-else-if="loadError && !rows.length" class="py-8 text-sm text-ink-red-4">
+				{{ loadError }}
+			</div>
+			<!-- a running run with no snapshot yet: the timeline above carries the
+			     progress, so this only says where the findings will land -->
+			<div
+				v-else-if="!rows.length && run.status === 'running'"
+				class="py-8 text-sm text-ink-gray-5"
+			>
+				Findings appear here when the run completes.
+			</div>
+			<div v-else-if="!rows.length" class="py-8 text-sm text-ink-gray-5">
+				{{ emptyText }}
+			</div>
+
+			<!-- findings grouped by severity: blocker → warning → note -->
+			<div v-for="group in groups" :key="group.severity" class="mt-5">
+				<div class="flex items-center gap-2">
+					<span class="text-base font-semibold text-ink-gray-9">
+						{{ SEVERITY_LABEL[group.severity] }}
+					</span>
+					<!-- true server-side count (envelope severity_counts), not the loaded slice -->
+					<span class="text-sm text-ink-gray-5">({{ groupCount(group) }})</span>
+				</div>
+				<div class="mt-2 divide-y overflow-hidden rounded-lg border">
+					<div v-for="f in group.rows" :key="f.name">
+						<!-- collapsed row (div, not button - it hosts the state select);
+					     role/tabindex + enter/space keep it keyboard-operable.
+					     jarvis#1062 P1-5: focus-visible ring added - none of this was
+					     there before, so tabbing to a finding row was invisible. -->
+						<div
+							role="button"
+							tabindex="0"
+							:aria-expanded="isExpanded(f.name)"
+							class="flex w-full cursor-pointer flex-wrap items-start gap-3 px-3 py-3 hover:bg-surface-gray-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-outline-gray-3"
+							@click="toggleExpand(f.name)"
+							@keydown.enter.prevent="toggleExpand(f.name)"
+							@keydown.space.prevent="toggleExpand(f.name)"
+						>
+							<FeatherIcon
+								name="chevron-right"
+								class="size-4 shrink-0 text-ink-gray-5 transition-all duration-300 ease-in-out"
+								:class="{ 'rotate-90': isExpanded(f.name) }"
+							/>
+							<Badge
+								class="shrink-0"
+								variant="subtle"
+								:theme="SEVERITY_THEME[f.severity] || 'gray'"
+								:label="severityBadgeLabel(f.severity)"
+							/>
+							<!-- advisory (non-attesting) signal: a visible worklist item that does
+							     NOT gate the run verdict or the clean attestation. -->
+							<Badge
+								v-if="f.advisory"
+								class="shrink-0"
+								variant="subtle"
+								theme="blue"
+								label="Advisory"
+							/>
+							<!-- jarvis#1062 P0-2/P1-3: the rule code used to sit here as an
+							     unlabeled, truncated monospace column - engineering output
+							     ahead of the human summary. It now lives ONLY in the
+							     expanded finding's "Technical details" block, labelled. -->
+							<div class="min-w-0 flex-1 basis-48">
+								<div class="break-words text-base font-medium text-ink-gray-9">
+									{{ findingTitle(f) }}
+								</div>
+								<div
+									v-if="f.ref_doctype && f.ref_name"
+									class="mt-1 break-words text-sm text-ink-gray-6"
+								>
+									{{ f.ref_doctype }} · {{ f.ref_name }}
+								</div>
+								<div
+									class="mt-1 flex flex-wrap items-center gap-x-2 text-xs text-ink-gray-5"
+								>
+									<span v-if="RESULT_CLASS_LABEL[f.result_class]">
+										{{
+											displayFor(f.name).arReview
+												? "Derived review"
+												: RESULT_CLASS_LABEL[f.result_class]
+										}}
+									</span>
+									<span v-if="f.result_class === 'derived_candidate'">
+										{{
+											displayFor(f.name).arReview &&
+											(!f.confirmation_status ||
+												f.confirmation_status === "unconfirmed")
+												? "Not independently confirmed"
+												: CONFIRMATION_LABEL[f.confirmation_status] ||
+												  "Awaiting confirmation"
+										}}
+									</span>
+								</div>
+							</div>
+							<span
+								v-if="hasAmount(f)"
+								data-testid="finding-amount"
+								class="shrink-0 text-right text-base text-ink-gray-8"
+							>
+								{{ fmtAmount(f.amount) }}
+							</span>
+							<Badge
+								class="shrink-0"
+								variant="subtle"
+								:theme="RECURRENCE_THEME[f.recurrence] || 'gray'"
+								:label="RECURRENCE_LABEL[f.recurrence] || 'New'"
+							/>
+							<!-- stop keydown too: enter/space on the select must not toggle the row -->
+							<div class="w-36 shrink-0" @click.stop @keydown.stop>
+								<FormControl
+									type="select"
+									:options="STATE_OPTIONS"
+									:modelValue="f.state"
+									:disabled="busy === f.name"
+									@update:modelValue="(v) => moveFinding(f, v)"
+								/>
+							</div>
+						</div>
+
+						<!-- expanded: the recorded detail - detail_md, the referenced
+					     document, the statutory caveat, and the finding actions -->
+						<div
+							v-if="isExpanded(f.name)"
+							class="border-t bg-surface-gray-1 px-4 py-3"
+						>
+							<!-- O1: renderMarkdown from @/markdown (escapes HTML first - safe).
+							     jarvis#1062 P0-2: the machine tokens findingDisplay() lifted
+							     out (rule codes, boolean eval flags, not_evaluable class
+							     counts, DocType.field refs) render ONLY in Technical details
+							     below - never in this primary sentence. displayFor(f.name)
+							     reads the precomputed findingDisplayMap entry - one
+							     extraction pass per finding, not one per template read. -->
+							<ArFindingDetails
+								v-if="displayFor(f.name).arReview"
+								:presentation="displayFor(f.name).arReview"
+								:finding="f"
+							/>
+							<div
+								v-else-if="displayFor(f.name).text"
+								class="prose prose-sm max-w-none"
+								v-html="renderMarkdown(displayFor(f.name).text)"
+							/>
+							<div v-else class="text-sm text-ink-gray-5">
+								This run did not record an explanation for this finding. Review the
+								recorded evidence below or open the dashboard. Rerun the updated
+								auditor to obtain a complete explanation.
+							</div>
+
+							<div
+								v-if="
+									!displayFor(f.name).arReview &&
+									(f.match_basis || f.false_positive_path)
+								"
+								class="mt-4 space-y-3"
+							>
+								<div v-if="f.match_basis">
+									<h3 class="text-sm font-medium text-ink-gray-9">
+										Why it was flagged
+									</h3>
+									<p
+										class="mt-1 whitespace-pre-line break-words text-sm text-ink-gray-7"
+									>
+										{{ f.match_basis }}
+									</p>
+								</div>
+								<div v-if="f.false_positive_path">
+									<h3 class="text-sm font-medium text-ink-gray-9">
+										What to rule out
+									</h3>
+									<p
+										class="mt-1 whitespace-pre-line break-words text-sm text-ink-gray-7"
+									>
+										{{ f.false_positive_path }}
+									</p>
+								</div>
+							</div>
+
+							<div
+								v-if="f.ref_doctype && f.ref_name"
+								class="mt-3 flex items-center gap-2 text-sm"
+							>
+								<span class="shrink-0 text-ink-gray-5">Reference</span>
+								<a
+									:href="refUrl(f)"
+									target="_blank"
+									rel="noopener"
+									class="flex min-w-0 items-center gap-1 text-ink-gray-8 hover:underline"
+								>
+									<span class="truncate"
+										>{{ f.ref_doctype }} {{ f.ref_name }}</span
+									>
+									<FeatherIcon
+										name="external-link"
+										class="size-3.5 shrink-0 text-ink-gray-5"
+									/>
+								</a>
+							</div>
+
+							<!-- statutory caveat: the recorded basis, never a fabricated fix -->
+							<div
+								v-if="f.section || f.effective_date || f.disclaimer"
+								class="mt-3 rounded bg-surface-gray-2 px-3 py-2 text-xs text-ink-gray-5"
+							>
+								{{ caveatText(f) }}
+							</div>
+
+							<!-- jarvis#1062 P0-2/P1-3: rule code, evaluation flags,
+							     not_evaluable class counts and DocType.field references -
+							     collapsed, labelled, monospace. Never inline above. -->
+							<TechnicalDetails class="mt-1" :details="displayFor(f.name).details" />
+
+							<div class="mt-3 flex items-center gap-2">
+								<Button
+									variant="subtle"
+									label="Discuss in chat"
+									iconLeft="message-circle"
+									:loading="chatBusy === f.name"
+									:disabled="!!chatBusy && chatBusy !== f.name"
+									@click="discussInChat(f)"
+								/>
+								<Button
+									v-if="f.ref_doctype && f.ref_name"
+									variant="subtle"
+									label="Open document"
+									iconLeft="external-link"
+									@click="openDocument(f)"
+								/>
+							</div>
+						</div>
+					</div>
+				</div>
+			</div>
+
+			<!-- coverage honesty: the page cap must never be silent - always say how
+		     much of the run is on screen, and offer the rest -->
+			<div v-if="rows.length" class="mt-4 flex items-center justify-between gap-2">
+				<Button
+					v-if="hasMore"
+					variant="subtle"
+					label="Load more"
+					:loading="loading"
+					@click="loadMore()"
+				/>
+				<div v-else />
+				<span class="text-sm text-ink-gray-5"
+					>Showing {{ rows.length }} of {{ total }}</span
+				>
+			</div>
+		</template>
+
+		<!-- Notes on THIS run (owner decision, jarvis#1062: moved off the
+		     Configure tab, which was per-installation - a note belongs to what
+		     it is actually about). Every run status, running included; same
+		     CommentsSection/useDocmeta pair the Configure tab used, re-targeted
+		     at "Jarvis Agent Run" + this run's name instead of the
+		     installation.
+
+		     "Run notes", not "Notes": this panel ALREADY renders a "Notes"
+		     heading a few hundred pixels up - SEVERITY_LABEL.note, the group of
+		     note-severity findings. Two identical headings on one screen meaning
+		     two unrelated things is a collision the merge created, not a naming
+		     preference. -->
+		<section class="mt-6 border-t pt-6">
+			<CommentsSection
+				:docmeta="runDocmeta"
+				:can-comment="true"
+				heading="Run notes"
+				empty-text="No notes on this run yet."
+			/>
+		</section>
+	</div>
+</template>
+
+<script setup>
+// FindingsPanel - the right pane of AgentRunsBoard (DESIGN-V3 §7.2): the
+// selected run's findings, grouped by severity (blocker → warning → note),
+// each row expandable to the recorded detail_md (markdown), the referenced
+// document, and the statutory caveat (section/effective_date/disclaimer).
+// Any coverage-gapped run (incl. a data-gap "completed" one) carries a coverage-honesty
+// banner. Actions per finding:
+// Discuss in chat (take_finding_to_chat → /c/:id), Open document, and the
+// open/acknowledged/resolved state select → setFindingState (optimistic).
+// No remediation text is ever fabricated - only what the run persisted.
+import { ref, computed, watch, onBeforeUnmount } from "vue";
+import { useRouter } from "vue-router";
+import { Badge, Button, FeatherIcon, FormControl, Tooltip, toast } from "frappe-ui";
+import JvSpinner from "@/components/JvSpinner.vue";
+import Banner from "@/components/Banner.vue";
+import RunStepTimeline from "./RunStepTimeline.vue";
+import ArFindingDetails from "./ArFindingDetails.vue";
+import { arFindingPresentation } from "@/lib/arFindingPresentation";
+// Shared, not a local copy: this panel's header pill is one of the surfaces
+// @/lib/agentRunStatus exists to keep in step with the rail and the Activity
+// feed (jarvis#1062). A second table here is exactly the drift it prevents.
+import { STATUS_THEME, coverageWarned } from "@/lib/agentRunStatus";
+import { runModelInfo } from "@/lib/agentRunModel";
+import CommentsSection from "@/components/doc/CommentsSection.vue";
+import TechnicalDetails from "@/components/doc/TechnicalDetails.vue";
+import { useDocmeta } from "@/composables/useDocmeta";
+import { timeAgo, exactDate, formatDate, toLocalMs, fmtElapsed } from "@/utils/datetime";
+import { renderMarkdown } from "@/markdown";
+import { extractTechnicalDetails } from "@/lib/findingText";
+import * as api from "@/api";
+import { takeFindingToChat, stopAgentRun, listRunSteps } from "@/api/agents";
+import { errMessage as errMsg, errHtml } from "@/lib/errors";
+
+const props = defineProps({
+	// full row from list_runs_page: {name, status, trigger, started_at,
+	// finished_at, conversation, dashboard, findings_count, blocker_count,
+	// error, coverage_note, nature, pages_written, pages_json, ...}. `nature`
+	// + `pages_written`/`pages_json` drive the scribe branch (wiki pages instead
+	// of findings); `dashboard` is the saved Jarvis Dashboard
+	// name (Run.dashboard); the run header links to /dashboards/:id when set.
+	// NB: list_runs_page must include `dashboard` in its fields for the link to
+	// appear (cross-file — see report notes).
+	run: { type: Object, required: true },
+});
+// stopped: the parent (AgentRunsBoard) owns the run list - refresh it after a
+// successful stop so the rail's status/badge picks up the terminal state.
+const emit = defineEmits(["stopped"]);
+
+// jarvis#1062: Notes-on-a-run - the SAME useDocmeta/CommentsSection pair the
+// Configure tab used for the installation, re-targeted at the run. A ref
+// (not a plain string) so switching the selected run (this panel is REUSED
+// across rail clicks, not remounted - see the findings watch below) reloads
+// the right run's comments; docmeta_api gates on doc.owner/System Manager,
+// which already resolves correctly for a run (its `owner` is reassigned to
+// the installation owner at launch, never Administrator - agent_scheduler.py
+// _launch_audit).
+const runDocmeta = useDocmeta(
+	"Jarvis Agent Run",
+	computed(() => props.run && props.run.name)
+);
+
+const router = useRouter();
+
+const SEVERITY_THEME = { blocker: "red", warning: "orange", note: "gray" };
+const SEVERITY_ORDER = ["blocker", "warning", "note"];
+const SEVERITY_LABEL = { blocker: "Blockers", warning: "Warnings", note: "Notes" };
+const RECURRENCE_THEME = { new: "blue", recurring: "gray", resolved: "green" };
+const RECURRENCE_LABEL = { new: "New", recurring: "Recurring", resolved: "Resolved" };
+const STATE_CHIPS = [
+	{ label: "All", value: "" },
+	{ label: "Open", value: "open" },
+	{ label: "Acknowledged", value: "acknowledged" },
+	{ label: "Resolved", value: "resolved" },
+];
+const STATE_OPTIONS = [
+	{ label: "Open", value: "open" },
+	{ label: "Acknowledged", value: "acknowledged" },
+	{ label: "Resolved", value: "resolved" },
+];
+
+const PAGE_LENGTH = 100;
+
+const rows = ref([]);
+const total = ref(0);
+const hasMore = ref(false);
+// true per-severity counts from the list_findings envelope ({blocker,
+// warning, note}); null until an envelope-shaped response arrives
+const severityCounts = ref(null);
+const loading = ref(false);
+const loadError = ref("");
+const stateFilter = ref("");
+const busy = ref("");
+const chatBusy = ref("");
+const stopping = ref(false);
+const expanded = ref(new Set());
+
+// ── #1062: the per-run STEP TIMELINE. A ticking elapsed-time label plus the
+// steps the bench observed THIS run take (list_run_steps), so a running run
+// reads as alive and step-by-step instead of a static "in progress" line. The
+// steps outlive the run: a finished one keeps them behind a collapsed
+// disclosure, which is why they are fetched for a terminal run too. ──────────
+const nowTick = ref(Date.now());
+const steps = ref([]);
+let elapsedTimer = null;
+let stepsTimer = null;
+
+const STEPS_POLL_MS = 5000;
+
+const elapsedLabel = computed(() => {
+	const startMs = props.run && toLocalMs(props.run.started_at);
+	if (startMs == null) return fmtElapsed(0);
+	return fmtElapsed((nowTick.value - startMs) / 1000);
+});
+
+// Monotonic request id, like the findings load: rapid rail clicks must not land
+// another run's steps on the pinned run.
+let stepsReqId = 0;
+async function loadSteps() {
+	if (!props.run || !props.run.name) return;
+	const id = ++stepsReqId;
+	try {
+		const res = await listRunSteps(props.run.name);
+		if (id !== stepsReqId) return;
+		steps.value = (res && res.steps) || [];
+	} catch {
+		// Best-effort narration: a failed fetch leaves the last steps on screen and
+		// the elapsed timer ticking. It must never turn a healthy run into an error
+		// state - the findings load owns that.
+	}
+}
+function startStepsPoll() {
+	if (elapsedTimer) return; // already running
+	nowTick.value = Date.now();
+	elapsedTimer = setInterval(() => (nowTick.value = Date.now()), 1000);
+	loadSteps();
+	// Visibility-guarded, mirroring the rows poll in AgentRunsBoard.vue: a
+	// backgrounded tab must not burn a request every 5s.
+	stepsTimer = setInterval(() => {
+		if (document.visibilityState === "visible") loadSteps();
+	}, STEPS_POLL_MS);
+}
+function stopStepsPoll() {
+	if (elapsedTimer) {
+		clearInterval(elapsedTimer);
+		elapsedTimer = null;
+	}
+	if (stepsTimer) {
+		clearInterval(stepsTimer);
+		stepsTimer = null;
+	}
+}
+onBeforeUnmount(stopStepsPoll);
+
+const runLabel = computed(() =>
+	props.run && props.run.started_at ? timeAgo(props.run.started_at) : props.run.name
+);
+// a failed run shows ONLY the red failed banner - never the amber coverage one.
+// Delegates to the shared coverageWarned so the board triangle and this banner never
+// drift (every partial run also carries a coverage_note, so the note gate subsumes it).
+const coverageWarning = computed(() => coverageWarned(props.run));
+// jarvis#1062 P0-2: coverage_note is bundle-generated too - the same
+// extraction as findings' detail_md, so a rule code / DocType.field
+// reference in the coverage sentence lands in coverageDetails, never inline.
+const coverageExtract = computed(() => extractTechnicalDetails(props.run.coverage_note));
+const coverageNote = computed(() => {
+	const note = coverageExtract.value.text.trim();
+	// the sentence supplies its own terminal punctuation
+	return note.replace(/[.\s]+$/, "") || "some records were not reviewed";
+});
+const coverageDetails = computed(() => coverageExtract.value.details);
+// T6: per-agent minimum model - null on a legacy run (rendered as nothing).
+const modelInfo = computed(() => runModelInfo(props.run));
+
+// Scribe runs (Custom App Learning) write wiki pages, not findings: render the
+// pages tally + links instead of the findings machinery.
+const isScribe = computed(() => props.run && props.run.nature === "Scribe");
+const scribePages = computed(() => {
+	try {
+		const arr = JSON.parse(props.run.pages_json || "[]");
+		return Array.isArray(arr) ? arr.filter((p) => p && p.slug) : [];
+	} catch {
+		return [];
+	}
+});
+// The wiki page docname IS its slug (autoname field:slug), so the desk form
+// opens the exact page an admin can read/edit.
+function wikiUrl(slug) {
+	return `/app/jarvis-wiki-page/${encodeURIComponent(slug)}`;
+}
+// "running" is handled by its own branch above (#1062 C3 progress display) -
+// this only ever renders for a run that has already finished (or stopped).
+const emptyText = computed(() => {
+	if (props.run.status === "failed") return "This run recorded no findings.";
+	if (props.run.status === "stopped") return "This run was stopped before it reported findings.";
+	return `No ${stateFilter.value ? stateFilter.value + " " : ""}findings for this run.`;
+});
+
+// blocker → warning → note, unknown severities folded into note
+const groups = computed(() => {
+	const by = {};
+	for (const r of rows.value) {
+		const sev = SEVERITY_ORDER.includes(r.severity) ? r.severity : "note";
+		(by[sev] = by[sev] || []).push(r);
+	}
+	return SEVERITY_ORDER.filter((s) => by[s] && by[s].length).map((s) => ({
+		severity: s,
+		rows: by[s],
+	}));
+});
+
+// header count = the TRUE server-side count for the severity (envelope
+// severity_counts); the loaded slice length is only the legacy fallback
+function groupCount(group) {
+	const c = severityCounts.value && severityCounts.value[group.severity];
+	return c != null ? c : group.rows.length;
+}
+
+// title-case badge label (Blocker/Warning/Note) to match the group headers
+const SEVERITY_BADGE = { blocker: "Blocker", warning: "Warning", note: "Note" };
+const RESULT_CLASS_LABEL = {
+	observed_fact: "Recorded observation",
+	derived_candidate: "Candidate for review",
+	legal_scenario: "Rule-based scenario",
+	confirmed_outcome: "Confirmed outcome",
+};
+const CONFIRMATION_LABEL = {
+	unconfirmed: "Awaiting confirmation",
+	confirmed: "Confirmed",
+	rejected: "Rejected",
+};
+function findingTitle(finding) {
+	const title = String(finding.title || "").trim();
+	if (title) return title;
+	const reference = [finding.ref_doctype, finding.ref_name].filter(Boolean).join(" ");
+	return reference ? `Review ${reference}` : "Finding needs review";
+}
+function hasAmount(finding) {
+	const amount = Number(finding.amount);
+	return Number.isFinite(amount) && amount !== 0;
+}
+function severityBadgeLabel(sev) {
+	if (SEVERITY_BADGE[sev]) return SEVERITY_BADGE[sev];
+	const s = String(sev || "note");
+	return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+// monotonic request id - rapid rail clicks must not land stale findings
+let reqId = 0;
+async function load({ append = false } = {}) {
+	if (!props.run || !props.run.name) return;
+	// a scribe run has no findings snapshot to fetch — its pages come inline
+	if (isScribe.value) return;
+	const id = ++reqId;
+	loading.value = true;
+	try {
+		const res = await api.listAgentFindings({
+			run: props.run.name,
+			state: stateFilter.value || undefined,
+			start: append ? rows.value.length : 0,
+			page_length: PAGE_LENGTH,
+		});
+		if (id !== reqId) return;
+		// envelope {rows, total, has_more, start, page_length, severity_counts};
+		// defensively fall back to the legacy bare-array shape
+		const isEnvelope = !!(res && !Array.isArray(res) && Array.isArray(res.rows));
+		const page = (isEnvelope ? res.rows : res) || [];
+		if (append) {
+			const seen = new Set(rows.value.map((r) => r.name));
+			rows.value = [...rows.value, ...page.filter((r) => !seen.has(r.name))];
+		} else {
+			rows.value = page;
+		}
+		if (isEnvelope) {
+			total.value = res.total != null ? res.total : rows.value.length;
+			hasMore.value = !!res.has_more;
+			severityCounts.value = res.severity_counts || null;
+		} else {
+			total.value = rows.value.length;
+			hasMore.value = false;
+			severityCounts.value = null;
+		}
+		loadError.value = "";
+	} catch (e) {
+		if (id === reqId) {
+			loadError.value = errMsg(e);
+			toast.error(loadError.value);
+		}
+	} finally {
+		if (id === reqId) loading.value = false;
+	}
+}
+function loadMore() {
+	if (!loading.value && hasMore.value) load({ append: true });
+}
+
+// reload on run switch AND on status flip (a re-pinned running run that just
+// completed now has a findings snapshot to show). Watch the name/status
+// STRINGS, not the run object - the rail re-pins a fresh row object on every
+// refresh and object identity alone must not re-fetch findings.
+watch(
+	[() => props.run && props.run.name, () => props.run && props.run.status],
+	([name, status], [prevName, prevStatus] = []) => {
+		// Step timeline: independent of the findings reload below, and evaluated
+		// first so the state-filter early-return further down never skips it.
+		if (name !== prevName) steps.value = [];
+		if (status === "running") {
+			// switching from one running run to another must re-arm the poll, not
+			// leave it pointed at the previous run's elapsed clock
+			if (name !== prevName) stopStepsPoll();
+			startStepsPoll();
+		} else {
+			stopStepsPoll();
+			// One last fetch on the flip to terminal: the closing writeback step
+			// lands in the same instant the status changes, so stopping the interval
+			// alone would leave the timeline permanently one step short. A run
+			// selected while already finished takes this branch too, which is what
+			// fills its collapsed "Steps (N)" disclosure.
+			if (name && (name !== prevName || prevStatus === "running")) loadSteps();
+		}
+		if (name !== prevName) {
+			rows.value = [];
+			total.value = 0;
+			hasMore.value = false;
+			severityCounts.value = null;
+			loadError.value = "";
+			expanded.value = new Set();
+			if (stateFilter.value) {
+				stateFilter.value = ""; // its watcher runs the (re)load
+				return;
+			}
+		}
+		load();
+	},
+	{ immediate: true }
+);
+watch(stateFilter, () => load());
+
+function isExpanded(name) {
+	return expanded.value.has(name);
+}
+function toggleExpand(name) {
+	const next = new Set(expanded.value);
+	if (next.has(name)) next.delete(name);
+	else next.add(name);
+	expanded.value = next;
+}
+
+// ── triage: state select → setFindingState (optimistic, revert on error) ────
+async function moveFinding(f, state) {
+	if (!state || state === f.state || busy.value) return;
+	const prev = f.state;
+	f.state = state; // optimistic
+	busy.value = f.name;
+	try {
+		await api.setFindingState(f.name, state);
+		toast.success(`Finding ${state}`);
+		// reconcile with the active state-filter chip: a finding moved OUT of
+		// the filtered state leaves the visible list (and its counts) at once -
+		// acknowledging while viewing "Open" must not leave a stale row
+		if (stateFilter.value && state !== stateFilter.value) {
+			rows.value = rows.value.filter((r) => r.name !== f.name);
+			total.value = Math.max(0, total.value - 1);
+			const sev = SEVERITY_ORDER.includes(f.severity) ? f.severity : "note";
+			if (severityCounts.value && severityCounts.value[sev] != null) {
+				severityCounts.value = {
+					...severityCounts.value,
+					[sev]: Math.max(0, severityCounts.value[sev] - 1),
+				};
+			}
+			if (expanded.value.has(f.name)) {
+				const next = new Set(expanded.value);
+				next.delete(f.name);
+				expanded.value = next;
+			}
+		}
+	} catch (e) {
+		f.state = prev;
+		toast.error(errHtml(e));
+	} finally {
+		busy.value = "";
+	}
+}
+
+// ── #1062 C2: operator stop (soft, idempotent server-side - no confirm) ─────
+async function stopRun() {
+	if (stopping.value || props.run.status !== "running") return;
+	stopping.value = true;
+	try {
+		await stopAgentRun(props.run.name);
+		toast.success("Run stopped");
+		emit("stopped");
+	} catch (e) {
+		toast.error(errHtml(e));
+	} finally {
+		stopping.value = false;
+	}
+}
+
+// ── actions: take-to-chat + open-doc (decision: NO fabricated remediation) ──
+async function discussInChat(f) {
+	if (chatBusy.value) return;
+	chatBusy.value = f.name;
+	try {
+		const res = (await takeFindingToChat(f.name)) || {};
+		// take_finding_to_chat always creates the conversation, even when
+		// seeding it (send_message) fails - so `ok`, not `conversation`, is the
+		// real success signal (#1062 polish: this used to navigate regardless).
+		if (!res.ok) {
+			toast.error(errHtml(res.reason || "Could not open this finding in chat."));
+			return;
+		}
+		router.push("/c/" + res.conversation);
+	} catch (e) {
+		toast.error(errHtml(e));
+	} finally {
+		chatBusy.value = "";
+	}
+}
+function openDocument(f) {
+	if (f.ref_doctype && f.ref_name) window.open(refUrl(f), "_blank");
+}
+
+function refUrl(row) {
+	const dt = String(row.ref_doctype || "")
+		.toLowerCase()
+		.replace(/ /g, "-");
+	return `/app/${dt}/${encodeURIComponent(row.ref_name)}`;
+}
+// jarvis#1062 P0-2/P1-3: the primary sentence a reviewer reads, plus every
+// machine token pulled out of it (rule code, eval flags, not_evaluable class
+// counts, DocType.field refs) as a flat labelled list for the collapsed
+// "Technical details" block. f.rule_id is a SEPARATE structured field (not
+// necessarily repeated inside detail_md's prose) - folded in here too,
+// de-duplicated against whatever extraction already found.
+function findingDisplay(f) {
+	const { text, details } = extractTechnicalDetails(f && f.detail_md);
+	const all = [...details];
+	if (f && f.rule_id && !all.some((d) => d.value === f.rule_id)) {
+		all.unshift({ label: "Rule", value: f.rule_id });
+	}
+	return { text, details: all, arReview: arFindingPresentation(f, props.run.agent) };
+}
+// Review fix: an expanded row's template read findingDisplay(f) 2-3 times
+// (the v-if, the v-html source, and TechnicalDetails' :details prop), each
+// call re-running the regex extraction pass over the same detail_md. Computed
+// once per finding here, keyed by the same f.name the row already keys on;
+// EMPTY_DISPLAY is a static fallback so a template read for a name not (yet)
+// in the map never throws.
+const EMPTY_DISPLAY = Object.freeze({ text: "", details: [] });
+const findingDisplayMap = computed(() => {
+	const map = new Map();
+	for (const f of rows.value) map.set(f.name, findingDisplay(f));
+	return map;
+});
+function displayFor(name) {
+	return findingDisplayMap.value.get(name) || EMPTY_DISPLAY;
+}
+// "Statutory basis: {section} (effective {date}). {disclaimer}" - only the
+// pieces the run recorded
+function caveatText(f) {
+	const bits = [];
+	if (f.section) {
+		const eff = f.effective_date ? ` (effective ${formatDate(f.effective_date)})` : "";
+		bits.push(`Statutory basis: ${f.section}${eff}.`);
+	} else if (f.effective_date) {
+		bits.push(`Effective ${formatDate(f.effective_date)}.`);
+	}
+	if (f.disclaimer) bits.push(String(f.disclaimer));
+	return bits.join(" ");
+}
+function fmtAmount(v) {
+	const n = Number(v);
+	return isNaN(n) ? String(v) : n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+</script>

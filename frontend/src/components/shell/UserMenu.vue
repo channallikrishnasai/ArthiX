@@ -1,0 +1,179 @@
+<template>
+	<Dropdown :options="menuOptions" @update:open="(open) => open && focusOpenMenu(triggerEl)">
+		<template #trigger="{ open }">
+			<button
+				ref="triggerEl"
+				class="jv-focus-ring relative flex h-12 items-center rounded-md py-2 duration-300 ease-in-out"
+				:class="
+					isCollapsed
+						? 'w-auto px-0'
+						: open
+						? 'w-full px-2 bg-surface-white shadow-sm'
+						: 'w-full px-2 hover:bg-surface-gray-3'
+				"
+				:aria-label="`${cardTitle} menu`"
+				@mouseenter="brandPeek = true"
+				@mouseleave="brandPeek = false"
+			>
+				<!-- the jarvis mark, 28×28 rounded — rendered from JarvisMark rather than
+				     a hand-pasted copy of its gradient + path data. That duplication is
+				     exactly what let the chat welcome mark drift to a different colour
+				     (design.md §2.2). idlePeek: this is the one mark that sits resting on
+				     every route, so it's the chosen surface for the designed idle blink.
+				     HolidayMark is JarvisMark plus today's holiday item, when there is one. -->
+				<HolidayMark
+					:size="28"
+					:radius="7"
+					:peek="brandPeek"
+					:mood="holdActive ? 'upgrading' : 'star'"
+					idlePeek
+				/>
+				<div
+					class="flex flex-1 flex-col overflow-hidden text-left duration-300 ease-in-out"
+					:class="isCollapsed ? 'ml-0 w-0 opacity-0' : 'ml-2 w-auto opacity-100'"
+				>
+					<div class="truncate text-base font-medium leading-none text-ink-gray-9">
+						{{ cardTitle }}
+					</div>
+					<div class="mt-1 truncate text-sm text-ink-gray-7">{{ fullName }}</div>
+				</div>
+				<FeatherIcon
+					v-if="!isCollapsed"
+					name="chevron-down"
+					class="h-4 w-4 shrink-0 text-ink-gray-5"
+				/>
+			</button>
+		</template>
+	</Dropdown>
+</template>
+
+<script setup>
+// Sidebar header (DESIGN-V3 §3.2.1): brand + session user, HD's UserMenu
+// pattern. Dropdown: Settings (D9) · Switch to Desk · Change theme · Log out.
+import { computed, inject, onMounted, onUnmounted, ref } from "vue";
+import { useRouter } from "vue-router";
+import { Dropdown, FeatherIcon } from "frappe-ui";
+import HolidayMark from "@/components/holiday/HolidayMark.vue";
+import { focusOpenMenu } from "@/lib/focusOpenMenu";
+import { useShellStore } from "@/stores/shell";
+import { useSupportStore } from "@/stores/support";
+import { useJarvisTheme } from "@/theme";
+import { brand } from "@/branding";
+import { holdActive } from "@/maintenanceGate";
+
+const props = defineProps({
+	isCollapsed: { type: Boolean, default: false },
+	// "chat" (default) = the Jarvis card + a "Support" link; "support" = a
+	// "Jarvis Support" title + a "Switch to Jarvis chat" link (we're already in support).
+	variant: { type: String, default: "chat" },
+});
+
+// Whole-card peek: hovering anywhere on the brand button (mark + name), not just
+// the mark itself, reveals the blinking eyes. Two tiny handlers because the
+// hover surface is the parent button, wider than the mark JarvisMark owns.
+const brandPeek = ref(false);
+
+// The menu's button: the menu it controls is the one to focus when it opens.
+const triggerEl = ref(null);
+
+// Card title: brand.agentName ("Jarvis") in chat; "<brand.agentName> Support" on the support rail.
+const cardTitle = computed(() =>
+	props.variant === "support" ? `${brand.agentName} Support` : brand.agentName
+);
+
+const shellStore = useShellStore();
+const session = inject("$session");
+const { effectiveDark, toggleTheme } = useJarvisTheme();
+
+// Support panel: `store` is the shared support-store singleton, kept fresh here
+// by this poll timer so the chat header's count pill (ChatView.vue's
+// jv-support-btn), this menu's "Support tickets · N" row, and the ticket
+// list always read the same awaiting-count value without each needing to
+// run its own poller. The avatar used to carry its own resting dot fed by
+// this same poll - removed once the header pill became the primary signal,
+// so a waiting reply now shows in exactly one place instead of two.
+const router = useRouter();
+const supportOn = window.support_available && window.has_support_access;
+const store = useSupportStore();
+let pollTimer = null;
+async function pollAwaiting() {
+	if (document.hidden) return;
+	await store.refreshAwaiting();
+}
+onMounted(() => {
+	if (!supportOn) return;
+	pollAwaiting();
+	pollTimer = setInterval(pollAwaiting, 60000);
+});
+onUnmounted(() => {
+	if (pollTimer) clearInterval(pollTimer);
+});
+
+function cookie(name) {
+	// URLSearchParams already percent-decodes; decoding AGAIN throws URIError
+	// when the display name contains a literal '%' (stored as %25 → '%'),
+	// blanking the whole shell — same bug main fixed in lib/user.js (0d19e7c).
+	return new URLSearchParams(document.cookie.split("; ").join("&")).get(name);
+}
+const fullName = cookie("full_name") || session.user || "User";
+
+// Chat card: Settings + Support tickets. Support card: "Switch to <agent> chat".
+// Both then share Switch to Desk + Change theme + Log out (theme is also a top-bar
+// shortcut on the support surface, same dual placement as the chat header).
+const menuOptions = computed(() => {
+	const menu = [];
+	if (props.variant === "support") {
+		menu.push({
+			label: `Switch to ${brand.agentName} chat`,
+			icon: "message-circle",
+			onClick: () => router.push({ name: "Chat" }),
+		});
+	} else {
+		menu.push({
+			label: "Settings",
+			icon: "settings",
+			onClick: () => shellStore.openSettings(),
+		});
+		// Support tickets -> the LIST (/support), gated on supportOn so it is never a
+		// dead link (the /support routes sit behind the same flags).
+		if (supportOn) {
+			menu.push({
+				label: store.awaitingCount
+					? `Support tickets · ${store.awaitingCount}`
+					: "Support tickets",
+				icon: "life-buoy",
+				onClick: () => router.push({ name: "Support" }),
+			});
+		}
+	}
+	menu.push({
+		label: "Switch to Desk",
+		icon: "grid",
+		onClick: () => {
+			window.location.href = "/app";
+		},
+	});
+	// Change theme is in the menu on both variants (also a top-bar shortcut on the
+	// support surface, same dual placement as the chat header).
+	menu.push({
+		label: "Change theme",
+		icon: effectiveDark.value ? "sun" : "moon",
+		onClick: () => toggleTheme(),
+	});
+	return [
+		{ group: "Menu", hideLabel: true, items: menu },
+		{
+			group: "Danger",
+			hideLabel: true,
+			items: [
+				{
+					label: "Log out",
+					icon: "log-out",
+					theme: "red",
+					onClick: () => session.logout(),
+				},
+			],
+		},
+	];
+});
+</script>

@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<!-- viewport-fit=cover lets env(safe-area-inset-*) report real notch/
+		     home-indicator insets on phones; interactive-widget keeps the layout
+		     viewport resizing when the on-screen keyboard opens so the composer
+		     stays above it. -->
+		<meta
+			name="viewport"
+			content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+		/>
+		<title>Jarvis Chat</title>
+		<!-- Favicon. The desktop app shipped with NO icon link at all (only the
+		     /jarvis-mobile PWA had one), so the browser tab fell back to whatever
+		     the Frappe site serves. The assets already existed on disk — they were
+		     simply never referenced here. theme-color tracks the app's own surface
+		     tokens (theme.js: --surface #ffffff light / #16161a dark). -->
+		<link rel="icon" type="image/png" sizes="192x192" href="/assets/jarvis/manifest/icon-192.png" />
+		<link rel="icon" type="image/png" sizes="512x512" href="/assets/jarvis/manifest/icon-512.png" />
+		<link rel="apple-touch-icon" href="/assets/jarvis/manifest/apple-touch-180.png" />
+		<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+		<meta name="theme-color" content="#16161a" media="(prefers-color-scheme: dark)" />
+		<!-- No Google Fonts link: frappe-ui bundles InterVar locally (its CSS
+		     @font-face wins anyway), so the external stylesheet was a
+		     render-blocking duplicate. -->
+		<!-- Paint the saved theme BEFORE the app mounts so a refresh doesn't flash
+		     white (FOUC) on the way to dark, and fade the app in smoothly. -->
+		<style>
+			html, body { margin: 0; background: #ffffff; }
+			html.jv-preload-dark, html.jv-preload-dark body { background: #16161a; }
+			#app { animation: jv-appin 0.24s ease both; }
+			@keyframes jv-appin { from { opacity: 0; } to { opacity: 1; } }
+		</style>
+		<script>
+			(function () {
+				try {
+					var t = localStorage.getItem("jarvis-theme") || "system"
+					var dark =
+						t === "dark" ||
+						(t === "system" &&
+							window.matchMedia &&
+							window.matchMedia("(prefers-color-scheme: dark)").matches)
+					if (dark) document.documentElement.classList.add("jv-preload-dark")
+					// frappe-ui bridge (DESIGN-V3 §14 DA-05): the preset's dark
+					// selector is [data-theme="dark"], so set it pre-boot too.
+					document.documentElement.dataset.theme = dark ? "dark" : "light"
+				} catch (e) {}
+			})()
+		</script>
+	</head>
+	<body>
+		<div id="app"></div>
+		<!-- frappe-ui's jinjaBootData plugin injects window.<bootkey> = … here at
+		     build time; Frappe fills the values at /jarvis via www/jarvis.py. -->
+		<script type="module" src="/src/main.js"></script>
+	</body>
+</html>

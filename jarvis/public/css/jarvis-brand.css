@@ -1,0 +1,35 @@
+:root {
+	--jarvis-primary:       #7C3AED;
+	--jarvis-primary-dark:  #0F0F0F;
+	--jarvis-primary-light: #A78BFA;
+	--jarvis-gradient:      linear-gradient(135deg, #A78BFA 0%, #7C3AED 50%, #0F0F0F 100%);
+	--jarvis-primary-faint: rgba(124, 58, 237, 0.18);
+	--jarvis-primary-soft:  rgba(124, 58, 237, 0.10);
+}
+
+/* =============================================================
+ * Immersive Jarvis surfaces — hide the Frappe Desk chrome (global
+ * navbar + page-head) on the customer-facing Jarvis pages so they
+ * read as a native product, not a page bolted onto Desk. Frappe sets
+ * body[data-route="..."] on every navigation (views/container.js), so
+ * this is purely route-scoped: the chrome returns automatically on
+ * every other Desk page. Loaded globally via app_include_css.
+ * ============================================================= */
+body[data-route^="jarvis-chat"] .navbar,
+body[data-route^="jarvis-onboarding"] .navbar,
+body[data-route^="jarvis-chat"] .page-head,
+body[data-route^="jarvis-onboarding"] .page-head {
+	display: none !important;
+}
+
+/* With the navbar gone, reclaim its vertical space so the Jarvis surface
+ * starts at the very top of the viewport. */
+body[data-route^="jarvis-chat"] .main-section,
+body[data-route^="jarvis-onboarding"] .main-section {
+	padding-top: 0 !important;
+}
+
+body[data-route^="jarvis-chat"] .page-body,
+body[data-route^="jarvis-onboarding"] .page-body {
+	margin-top: 0 !important;
+}

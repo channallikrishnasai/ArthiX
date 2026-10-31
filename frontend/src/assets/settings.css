@@ -1,0 +1,398 @@
+/* ============================================================================
+   Unified Settings Dialog — shared, UNSCOPED stylesheet.
+
+   Recipes follow design.md (repo root): the Frappe design language mapped onto
+   the legacy jv-* custom-property palette (design.md §2.2). Colours come from
+   the CSS custom properties (--text / --surface / --border / …) that the dialog
+   root sets via :style="paletteVars" + :class="{'jv-dark': dark}".
+
+   Hard rules baked in here (design.md §1, §3.1):
+   - hover = background/border colour shift only; no translateY / scale / lift
+   - controls are 28px (sm) / 32px (md) tall, 8px radius
+   - one solid primary per surface; secondary = subtle gray fill
+   - shadow-sm marks the ACTIVE thing (nav item, segmented pill), never a hover
+   ========================================================================== */
+
+/* ===== settings panel (centered modal with a left section rail) ===== */
+.jv-settings-overlay {
+	position: fixed;
+	inset: 0;
+	z-index: 60;
+	background: rgba(0, 0, 0, 0.27);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 24px;
+}
+/* z-index 60: the shell ConfirmDialog uses 200 to sit above this. */
+/* Height is ADAPTIVE (was a hard 560px): the compact AI-models pane left roughly
+   half the dialog empty. `auto` sizes to the tallest column, clamped by
+   min/max. NOTE the left rail is the practical floor (~12 nav items), so short
+   panes settle around ~470px rather than hugging their content. min-height keeps
+   a one-item pane from collapsing; max-height keeps tall panes on screen -- they
+   scroll inside .jv-settings-body, which needs min-height:0 (below) to do so now
+   that the parent no longer has a definite height. */
+/* FIXED height on purpose. An earlier pass made this height:auto so short panes
+   could shrink — but that made the dialog jump every time you picked a different
+   nav item, which is worse than a little empty space. It is a stable frame: panes
+   fill it, and .jv-settings-body scrolls when a pane is taller.
+   Width 1080px is a CAP, not a fixed size: max-width resolves against the overlay's
+   content box (100vw - 48px), so the dialog still shrinks fluidly with the viewport
+   (measured: 1280->1058, 1024->956, 768->706). A px cap is deliberate — a settings
+   dialog stretched across a 4K monitor is unreadable.
+   min() guards a short viewport: a bare height/min-height BEATS max-height in the
+   cascade, so on a landscape phone the dialog would grow past the screen.
+   Below 720px the fixed rail can't fit — see the stacking media query at the end. */
+@keyframes jv-popin {
+	from {
+		transform: scale(0.98);
+		opacity: 0.5;
+	}
+	to {
+		transform: scale(1);
+		opacity: 1;
+	}
+}
+/* min-height:0 — REQUIRED now that .jv-settings is height:auto/max-height. A flex
+   item defaults to min-height:auto, which refuses to shrink below its content, so
+   a tall pane would blow past max-height and get clipped by the shell's
+   overflow:hidden instead of scrolling in .jv-settings-body. */
+/* Pane-owned header (design.md §4.1): title + optional description left, ghost
+   close right. The dialog renders it once; panes carry no duplicate heading. */
+
+/* Overlay-style scrollbar for the settings dialog's scroll regions (this
+   legacy .jv-settings-body plus SettingsPane.vue's own overflow-y-auto div,
+   which is what most panes actually scroll inside), modelled on Claude's
+   settings dialog: invisible at rest, revealed only while the user is
+   scrolling or hovering the region, and parked in scrollbar-gutter so the
+   thumb never sits on top of pane content. Scoped to .jv-scroll-overlay /
+   .jv-settings-body rather than widening the ::-webkit-scrollbar rule in
+   main.css -- that rule is global and would restyle every scrollable surface
+   in the product, not just this dialog. */
+.jv-scroll-overlay {
+	scrollbar-gutter: stable;
+	scrollbar-width: thin;
+	scrollbar-color: transparent transparent;
+	/* scrollbar-gutter reserves nothing for macOS OVERLAY scrollbars, so the
+	   thumb is painted ON TOP of whatever sits at the right edge - right-aligned
+	   danger-zone buttons ended up half-covered by it. Keep content clear of the
+	   thumb's track by hand, with enough room that the bar reads as chrome
+	   sitting beside the pane rather than crowding its buttons. */
+	padding-right: 20px;
+}
+.jv-scroll-overlay::-webkit-scrollbar {
+	width: 7px;
+	height: 7px;
+}
+.jv-scroll-overlay::-webkit-scrollbar-track {
+	background: transparent;
+}
+.jv-scroll-overlay::-webkit-scrollbar-thumb {
+	background-color: transparent;
+	border-radius: 8px;
+	border: 2px solid transparent;
+	background-clip: padding-box;
+	transition: background-color 0.15s ease;
+}
+.jv-scroll-overlay:hover,
+.jv-scroll-overlay:focus-within {
+	scrollbar-color: #d6d6dc transparent;
+}
+.jv-scroll-overlay:hover::-webkit-scrollbar-thumb,
+.jv-scroll-overlay:focus-within::-webkit-scrollbar-thumb {
+	background-color: #d6d6dc;
+	background-clip: padding-box;
+}
+.jv-scroll-overlay::-webkit-scrollbar-thumb:hover {
+	background-color: #c2c2ca;
+	background-clip: padding-box;
+}
+/* dark thumb colours, mirroring the dark override for the global scrollbar
+   rule in main.css */
+:root[data-theme="dark"] .jv-scroll-overlay:hover,
+:root[data-theme="dark"] .jv-scroll-overlay:focus-within {
+	scrollbar-color: #3a3a45 transparent;
+}
+:root[data-theme="dark"] .jv-scroll-overlay:hover::-webkit-scrollbar-thumb,
+:root[data-theme="dark"] .jv-scroll-overlay:focus-within::-webkit-scrollbar-thumb {
+	background-color: #3a3a45;
+}
+:root[data-theme="dark"] .jv-scroll-overlay::-webkit-scrollbar-thumb:hover {
+	background-color: #4a4a55;
+}
+
+/* Panes whose content is much shorter than the dialog. The dialog height cannot
+   shrink to fit them: the left rail (~516px of nav items) is the floor, while the
+   AI-models pane is only ~164px -- leaving ~276px of dead white space. So fill the
+   column and let the pane's action bar sink to the bottom, turning that space into
+   a footer (the same anchored-actions pattern the onboarding wizard uses).
+   margin-top:auto is inert outside a flex column, so the same editor rendered in
+   AccountView (normal flow) is unaffected, and onboarding never renders the bar at
+   all (:footerless). */
+.jv-pane-fill {
+	display: flex;
+	flex-direction: column;
+}
+.jv-pane-fill > .jv-llm-editor {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+}
+.jv-pane-fill .jv-pool-savebar {
+	margin-top: auto;
+	padding-top: 16px;
+	border-top: 1px solid var(--border);
+}
+/* usage stat cards */
+
+/* toggle switch — on-state is near-black (frappe Switch), not green */
+.jv-switch {
+	width: 38px;
+	height: 22px;
+	flex: none;
+	border: none;
+	border-radius: 11px;
+	background: var(--surface-3);
+	position: relative;
+	cursor: pointer;
+	padding: 0;
+	transition: background 0.15s;
+}
+.jv-switch.on {
+	background: var(--text);
+}
+.jv-switch-knob {
+	position: absolute;
+	top: 2px;
+	left: 2px;
+	width: 18px;
+	height: 18px;
+	border-radius: 50%;
+	background: #fff;
+	box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+	transition: left 0.15s;
+}
+.jv-switch.on .jv-switch-knob {
+	left: 18px;
+}
+/* dark: the ON track is near-white (var(--text)), so the knob flips dark */
+.jv-dark .jv-switch.on .jv-switch-knob {
+	background: var(--surface);
+}
+
+/* segmented control — one recipe for Appearance (.jv-seg), macro-run filters
+   (.jv-runchips) and the AI-models tabs (.jv-acct-aitabs): gray track, active
+   = raised chip (design.md §3.5) */
+
+/* activity rows */
+
+/* macro run history dashboard (Macro runs) */
+
+/* ============ BUTTONS (design.md §3.1 mapped to jv tokens) ============
+   Compose a variant with the base:
+     <button class="jv-btn jv-btn--primary">Save</button>   ← solid, ONE per surface
+     <button class="jv-btn jv-btn--ghost">Cancel</button>   ← subtle gray fill
+     <button class="jv-btn jv-btn--danger">Delete</button>  ← red subtle (confirm handles solid red)
+   Add --sm for the compact 28px size. Hover shifts colour only — never motion. */
+.jv-btn {
+	flex: none;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+	height: 32px;
+	padding: 0 12px;
+	border-radius: 8px;
+	border: 1px solid transparent;
+	background: transparent;
+	font-family: inherit;
+	font-size: 13px;
+	font-weight: 500;
+	line-height: 1;
+	white-space: nowrap;
+	cursor: pointer;
+	user-select: none;
+	transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.jv-btn:disabled {
+	opacity: 0.5;
+	cursor: default;
+	pointer-events: none;
+}
+.jv-btn svg {
+	flex: none;
+}
+.jv-btn--primary {
+	background: var(--text);
+	border-color: var(--text);
+	color: var(--surface);
+}
+.jv-btn--primary:hover {
+	background: var(--text-2);
+	border-color: var(--text-2);
+}
+.jv-btn--primary svg {
+	stroke: var(--surface);
+}
+.jv-btn--ghost {
+	background: var(--surface-2);
+	border-color: transparent;
+	color: var(--text);
+}
+.jv-btn--ghost:hover {
+	background: var(--surface-3);
+}
+.jv-btn--danger {
+	background: var(--red);
+	border-color: var(--red);
+	color: #fff;
+}
+.jv-btn--danger:hover {
+	background: color-mix(in srgb, var(--red) 88%, #000);
+	border-color: color-mix(in srgb, var(--red) 88%, #000);
+}
+.jv-btn--danger svg {
+	stroke: #fff;
+}
+.jv-btn--sm {
+	height: 28px;
+	padding: 0 10px;
+	font-size: 12.5px;
+	border-radius: 8px;
+}
+/* legacy single-dash danger modifier (used with jv-btn jv-btn--sm jv-btn-danger) */
+
+/* fade for the overlay (transition name="jv-fade") */
+.jv-fade-enter-active {
+	transition: opacity 0.1s ease-out;
+}
+.jv-fade-leave-active {
+	transition: opacity 0.15s ease-in;
+}
+.jv-fade-enter-from,
+.jv-fade-leave-to {
+	opacity: 0;
+}
+
+/* ===== Account / billing (design.md §4.2) ===== */
+.jv-pill-ok {
+	color: var(--green);
+	background: var(--green-bg);
+}
+.jv-pill-warn {
+	color: var(--amber);
+	background: var(--amber-bg);
+}
+.jv-pill-bad {
+	color: var(--red);
+	background: var(--red-bg);
+}
+.jv-pill-muted {
+	color: var(--text-3);
+	background: var(--surface-2);
+}
+/* the upgrade CTA is an <a> (same Desk href) rendered as a quiet subtle button */
+/* scheduled-cancellation banner: warn-toned, above the plan actions */
+/* notice with an inline action (the cancellation notice carries Resume) */
+/* plan lifecycle actions (cancel / resume) sit below the feature list */
+/* manage-billing: a plain text link (design.md §4.2) */
+/* manage footer: billing link left, quiet cancel action right (same baseline) */
+/* cancel: a quiet text link, red only on hover — confirm dialog owns the red */
+
+/* ===== Monitor cards (Billing & metering) ===== */
+/* retry — same recipe as jv-btn--ghost --sm (one retry pattern, design.md §3.8) */
+.jv-mon-retry {
+	display: inline-flex;
+	align-items: center;
+	margin-left: 6px;
+	height: 24px;
+	border: none;
+	background: var(--surface-2);
+	color: var(--text);
+	border-radius: 8px;
+	padding: 0 10px;
+	font-size: 12px;
+	font-weight: 500;
+	font-family: inherit;
+	cursor: pointer;
+	transition: background-color 0.15s ease;
+}
+.jv-mon-retry:hover {
+	background: var(--surface-3);
+}
+
+/* AI-models tabs share the segmented recipe above; only the margin is local. */
+
+/* Rail group headers — 12px medium, sentence case (design.md §2.3; no uppercase). */
+
+/* Header close icon-button — quiet ghost hover (no colour inversion).
+   This is the ONLY global `.jv-iconbtn`, and its hover is deliberately NOT the
+   invert used on the chat surface (see the copies scoped to views/ChatView.vue
+   and components/chat/Composer.vue, which carry !important and would beat this
+   rule if they were ever unscoped). Three copies is intentional: sync the two
+   chat ones with each other, leave this one alone. */
+.jv-iconbtn {
+	width: 28px;
+	height: 28px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	background: transparent;
+	border: none;
+	border-radius: 8px;
+	cursor: pointer;
+	color: var(--text-3);
+	transition: background-color 0.15s ease, color 0.15s ease;
+}
+.jv-iconbtn:hover {
+	background: var(--surface-2);
+	color: var(--text);
+}
+
+/* ===== geometry/scrim overrides — kept textually identical to the
+   pre-restyle file so in-flight settings PRs (#278 dialog resize) merge
+   cleanly in either order; being last, these win the cascade. ===== */
+.jv-settings-overlay.jv-dark {
+	background: rgba(0, 0, 0, 0.55);
+}
+
+/* ===== narrow screens =======================================================
+   The rail is `flex: none; width: 230px`, so it never shrinks: at a 390px
+   viewport it left the content column just 110px (measured). Below 720px, stack
+   the dialog — the rail becomes a horizontal, scrollable tab strip above the
+   body. Group headings are dropped because they carry no meaning in a single
+   row; the items stay in the same order, so the grouping is still implied.
+   Placed at the very end so it outranks the .jv-settings-overlay padding rule
+   above. */
+@media (max-width: 720px) {
+	.jv-settings-overlay {
+		padding: 12px;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.jv-fade-enter-active,
+	.jv-fade-leave-active {
+		transition: none;
+	}
+}
+
+/* Admin tag — small pill next to the "Administration" rail group heading
+   (SettingsDialog.vue), marking that group as gated to Jarvis Admin/System
+   Manager, matching the .jv-mon-tag colour recipe (blue, not the green/amber
+   status tones used elsewhere). */
+.sm-tag {
+	display: inline-block;
+	margin-left: 6px;
+	padding: 1px 6px;
+	border-radius: 20px;
+	font-size: 9px;
+	font-weight: 600;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	background: var(--blue-bg);
+	border: 1px solid var(--blue-bd);
+	color: var(--text-2);
+	vertical-align: middle;
+}

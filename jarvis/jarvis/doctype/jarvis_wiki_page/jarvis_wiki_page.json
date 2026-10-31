@@ -1,0 +1,174 @@
+{
+  "doctype": "DocType",
+  "name": "Jarvis Wiki Page",
+  "module": "Jarvis",
+  "issingle": 0,
+  "custom": 0,
+  "engine": "InnoDB",
+  "autoname": "field:slug",
+  "field_order": [
+    "slug",
+    "title",
+    "page_type",
+    "scope",
+    "target_role",
+    "target_user",
+    "ref_doctype",
+    "ref_name",
+    "summary",
+    "body_md",
+    "sensitivity",
+    "status",
+    "sources",
+    "last_confirmed_at",
+    "contradiction_flag",
+    "manual_links",
+    "mirror_hash"
+  ],
+  "fields": [
+    {
+      "fieldname": "slug",
+      "fieldtype": "Data",
+      "label": "Slug",
+      "unique": 1,
+      "reqd": 1,
+      "description": "Lowercase page id, e.g. customer--acme-corp or doctype--sales-invoice."
+    },
+    {
+      "fieldname": "title",
+      "fieldtype": "Data",
+      "label": "Title",
+      "reqd": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "page_type",
+      "fieldtype": "Select",
+      "label": "Page Type",
+      "options": "Customer\nSupplier\nItem\nProcess\nDoctype\nException\nIntegration\nPeople\nOrg",
+      "reqd": 1,
+      "in_list_view": 1,
+      "in_standard_filter": 1,
+      "search_index": 1
+    },
+    {
+      "fieldname": "scope",
+      "fieldtype": "Select",
+      "label": "Scope",
+      "options": "Org\nRole\nUser",
+      "default": "Org",
+      "reqd": 1,
+      "in_standard_filter": 1,
+      "description": "Who can see this page. Org = every desk user; Role = holders of the target role; User = the target user only. System Managers see everything."
+    },
+    {
+      "fieldname": "target_role",
+      "fieldtype": "Link",
+      "options": "Role",
+      "label": "Target Role",
+      "depends_on": "eval:doc.scope=='Role'",
+      "mandatory_depends_on": "eval:doc.scope=='Role'",
+      "description": "Role whose holders can read this page (Role scope only)."
+    },
+    {
+      "fieldname": "target_user",
+      "fieldtype": "Link",
+      "options": "User",
+      "label": "Target User",
+      "depends_on": "eval:doc.scope=='User'",
+      "mandatory_depends_on": "eval:doc.scope=='User'",
+      "description": "The only user who can read this page (User scope only). Defaults to the creator."
+    },
+    {
+      "fieldname": "ref_doctype",
+      "fieldtype": "Data",
+      "label": "Reference DocType",
+      "search_index": 1,
+      "description": "ERP doctype this page is about (Customer, Supplier, Item, or a transactional doctype for Doctype-level pages)."
+    },
+    {
+      "fieldname": "ref_name",
+      "fieldtype": "Data",
+      "label": "Reference Name",
+      "search_index": 1,
+      "description": "ERP record this page is about; empty for Doctype/Process/Org-level pages."
+    },
+    {
+      "fieldname": "summary",
+      "fieldtype": "Small Text",
+      "label": "Summary",
+      "description": "One-paragraph gist (max 500 chars) inlined into chat context when the entity comes up."
+    },
+    {
+      "fieldname": "body_md",
+      "fieldtype": "Long Text",
+      "label": "Body (Markdown)"
+    },
+    {
+      "fieldname": "sensitivity",
+      "fieldtype": "Select",
+      "label": "Sensitivity",
+      "options": "A\nB\nC",
+      "default": "A"
+    },
+    {
+      "fieldname": "status",
+      "fieldtype": "Select",
+      "label": "Status",
+      "options": "Active\nArchived",
+      "default": "Active",
+      "in_standard_filter": 1,
+      "search_index": 1
+    },
+    {
+      "fieldname": "sources",
+      "fieldtype": "JSON",
+      "label": "Sources",
+      "read_only": 1,
+      "description": "Provenance trail: [{date, kind, ref, user}] appended on every applied update."
+    },
+    {
+      "fieldname": "last_confirmed_at",
+      "fieldtype": "Datetime",
+      "label": "Last Confirmed At",
+      "description": "When the content was last confirmed or refreshed; pages older than 90 days are flagged stale."
+    },
+    {
+      "fieldname": "contradiction_flag",
+      "fieldtype": "Check",
+      "label": "Contradiction Flagged",
+      "description": "Set when an extracted update contradicted the existing body; the conflicting info is appended as a flagged section, never silently overwritten."
+    },
+    {
+      "fieldname": "manual_links",
+      "fieldtype": "JSON",
+      "label": "Manual Links",
+      "description": "Human-curated [[link]] target slugs kept OUT of body_md so LLM re-ingestion (which full-replaces the body) can't clobber them. Unioned into the graph's links-to edges."
+    },
+    {
+      "fieldname": "mirror_hash",
+      "fieldtype": "Data",
+      "label": "Mirror Hash",
+      "hidden": 1,
+      "read_only": 1,
+      "no_copy": 1,
+      "description": "sha256 of the last markdown render pushed to the container mirror (Org pages only); the mirror sync diffs against it."
+    }
+  ],
+  "permissions": [
+    {
+      "role": "Desk User",
+      "read": 1
+    },
+    {
+      "role": "System Manager",
+      "read": 1,
+      "write": 1,
+      "create": 1,
+      "delete": 1
+    }
+  ],
+  "sort_field": "modified",
+  "sort_order": "DESC",
+  "track_changes": 1
+}

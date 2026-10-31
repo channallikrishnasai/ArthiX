@@ -1,0 +1,145 @@
+{
+  "doctype": "DocType",
+  "name": "Jarvis Voice Note",
+  "module": "Jarvis",
+  "issingle": 0,
+  "custom": 0,
+  "engine": "InnoDB",
+  "autoname": "hash",
+  "field_order": [
+    "kind",
+    "transcript",
+    "duration_s",
+    "attachment",
+    "url",
+    "extracted_text",
+    "context_type",
+    "conversation",
+    "question",
+    "entities",
+    "source",
+    "status",
+    "processed_at",
+    "processed_note"
+  ],
+  "fields": [
+    {
+      "fieldname": "kind",
+      "fieldtype": "Select",
+      "label": "Kind",
+      "options": "Text\nVoice\nAttachment\nLink",
+      "default": "Text",
+      "in_list_view": 1,
+      "in_standard_filter": 1,
+      "description": "How this note was captured. Voice = recorder transcript; for Attachment/Link, transcript stays the user's own words/caption (optional) while extracted_text holds the server-extracted content."
+    },
+    {
+      "fieldname": "transcript",
+      "fieldtype": "Long Text",
+      "label": "Transcript",
+      "description": "Required for Text/Voice notes (the user's own words); optional caption for Attachment/Link notes."
+    },
+    {
+      "fieldname": "duration_s",
+      "fieldtype": "Int",
+      "label": "Duration (s)"
+    },
+    {
+      "fieldname": "attachment",
+      "fieldtype": "Attach",
+      "label": "Attachment",
+      "description": "Private file for Attachment-kind notes."
+    },
+    {
+      "fieldname": "url",
+      "fieldtype": "Data",
+      "label": "URL",
+      "description": "Source link for Link-kind notes; must be http(s). Server-fetched at capture with SSRF guards (jarvis.chat.link_fetch, Wave B1); the fetched, readability-stripped text lands in extracted_text."
+    },
+    {
+      "fieldname": "extracted_text",
+      "fieldtype": "Long Text",
+      "label": "Extracted Text",
+      "read_only": 1,
+      "hidden": 1,
+      "description": "Server-extracted content for Attachment/Link notes (readability-stripped page text, or bounded document text extraction). The daily sweep and immediate-ingest path read extracted_text || transcript."
+    },
+    {
+      "fieldname": "context_type",
+      "fieldtype": "Select",
+      "label": "Context Type",
+      "options": "Business\nConversation",
+      "default": "Business",
+      "in_list_view": 1,
+      "in_standard_filter": 1
+    },
+    {
+      "fieldname": "conversation",
+      "fieldtype": "Link",
+      "label": "Conversation",
+      "options": "Jarvis Conversation",
+      "description": "Required for Conversation-context notes; optional provenance for Business notes captured from a chat nudge."
+    },
+    {
+      "fieldname": "question",
+      "fieldtype": "Link",
+      "label": "Question",
+      "options": "Jarvis Personalise Question",
+      "description": "Set when this note was captured as the answer to a Personalise question."
+    },
+    {
+      "fieldname": "entities",
+      "fieldtype": "JSON",
+      "label": "Entities",
+      "description": "Entities in view when the note was recorded: [{doctype, name}]."
+    },
+    {
+      "fieldname": "source",
+      "fieldtype": "Select",
+      "label": "Source",
+      "options": "Business Tab\nChat Nudge\nPersonalise\nMobile",
+      "default": "Business Tab",
+      "description": "Capture surface. This is the union; each endpoint allowlist (voice_notes_api._SOURCES, personalise_api._NOTE_SOURCES) is a subset of it."
+    },
+    {
+      "fieldname": "status",
+      "fieldtype": "Select",
+      "label": "Status",
+      "options": "New\nProcessed\nArchived",
+      "default": "New",
+      "in_list_view": 1,
+      "in_standard_filter": 1,
+      "search_index": 1
+    },
+    {
+      "fieldname": "processed_at",
+      "fieldtype": "Datetime",
+      "label": "Processed At",
+      "read_only": 1
+    },
+    {
+      "fieldname": "processed_note",
+      "fieldtype": "Small Text",
+      "label": "Processed Note",
+      "read_only": 1,
+      "description": "What the daily sweep did with this note (facts extracted / wiki ingest queued / nothing durable found)."
+    }
+  ],
+  "permissions": [
+    {
+      "role": "Jarvis User",
+      "read": 1,
+      "write": 1,
+      "create": 1,
+      "delete": 1,
+      "if_owner": 1
+    },
+    {
+      "role": "System Manager",
+      "read": 1
+    }
+  ],
+  "sort_field": "creation",
+  "sort_order": "DESC",
+  "track_changes": 0
+}

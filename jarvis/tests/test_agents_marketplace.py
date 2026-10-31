@@ -1,0 +1,1728 @@
+"""Integration tests for the Agents Marketplace backend (B3).
+
+The load-bearing test is the scheduler-identity regression (S1): a scheduled
+audit's conversation is owned by the installation owner and NEVER Administrator
+— the single most important control (a scheduled turn otherwise runs jarvis__*
+tools as Administrator, bypassing every DocType permission, silently). The rest
+cover mutation authZ (S3), the deterministic Run+Findings persistence with
+dedupe (O2), and catalog-sync idempotency.
+"""
+
+import json
+import unittest
+
+import frappe
+
+from jarvis.chat import agent_catalog, agent_scheduler, agents_api
+from jarvis.tests._agent_access import allow_listing_for, clear_listing_access
+
+LISTING = "Jarvis Agent Listing"
+INSTALLATION = "Jarvis Agent Installation"
+RUN = "Jarvis Agent Run"
+FINDING = "Jarvis Agent Finding"
+ACTIVITY = "Jarvis Agent Activity"
+ALLOWED_ROLE = "Jarvis Agent Allowed Role"
+
+ROLE_X = "Jarvis Agent Test Role X"
+ROLE_Y = "Jarvis Agent Test Role Y"
+
+# Every catalog agent this module installs, runs or pushes. Granted to the whole
+# cast in setUp because access is deny-by-default (jarvis#1062); allow_listing_for
+# no-ops on a slug this site's registry does not carry.
+_MODULE_SLUGS = (
+	"close-auditor",
+	"bank-recon-operator",
+	"ledger-scrutiny-auditor",
+	"custom-app-learning",
+)
+
+
+def _ensure_role(role_name: str) -> str:
+	if not frappe.db.exists("Role", role_name):
+		r = frappe.get_doc({"doctype": "Role", "role_name": role_name, "desk_access": 1})
+		r.flags.ignore_permissions = True
+		r.insert()
+		frappe.db.commit()
+	return role_name
+
+
+def _give_role(email: str, role_name: str) -> None:
+	u = frappe.get_doc("User", email)
+	if not any(r.role == role_name for r in u.roles):
+		u.append("roles", {"role": role_name})
+		u.flags.ignore_permissions = True
+		u.save()
+		frappe.db.commit()
+
+
+def _ensure_user(email: str) -> str:
+	from jarvis.permissions import ensure_jarvis_user_role
+
+	ensure_jarvis_user_role()
+	if not frappe.db.exists("User", email):
+		u = frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": email,
+				"first_name": email.split("@")[0],
+				"send_welcome_email": 0,
+				"enabled": 1,
+				"user_type": "System User",
+			}
+		)
+		u.flags.ignore_permissions = True
+		u.insert()
+		frappe.db.commit()
+	if frappe.db.get_value("User", email, "user_type") != "System User":
+		frappe.db.set_value("User", email, "user_type", "System User", update_modified=False)
+		frappe.clear_cache(user=email)
+	# The agents endpoints are chat-surface: they now require the Jarvis User
+	# role (security review TASK 8). Grant it so the fixtures reach the
+	# agent-specific allowed_roles / owner gates they actually test.
+	if "Jarvis User" not in set(frappe.get_roles(email)):
+		frappe.get_doc("User", email).add_roles("Jarvis User")
+		frappe.db.commit()
+	return email
+
+
+def _install_as(owner: str, agent_slug: str) -> str:
+	"""Create an installation owned by ``owner`` (running as that user so the
+	if_owner rows land correctly)."""
+	original = frappe.session.user
+	frappe.set_user(owner)
+	try:
+		res = agents_api.install_agent(agent_slug)
+		return res["data"]["name"]
+	finally:
+		frappe.set_user(original)
+
+
+class TestAgentsMarketplace(unittest.TestCase):
+	@classmethod
+	def setUpClass(cls):
+		frappe.set_user("Administrator")
+		agent_catalog.sync_agent_listings()
+		cls.owner = _ensure_user("agent-owner@example.com")
+		cls.other = _ensure_user("agent-other@example.com")
+		cls.admin = _ensure_user("agent-admin@example.com")
+		_ensure_role(ROLE_X)
+		_ensure_role(ROLE_Y)  # assigned to NOBODY — used to revoke access
+		_give_role(cls.owner, ROLE_X)
+		_give_role(cls.admin, "System Manager")
+		# The shipped delegate agents declare doctypes_required (GL Entry / Account
+		# / Company); the install A12-gate needs the run-as user to hold those reads.
+		# Accounts User grants them — give it to the non-admin fixtures so a
+		# legitimate install/run is not blocked by the read gate (the RBAC tests
+		# still gate on the agent's allowed_roles, a separate check).
+		if frappe.db.exists("Role", "Accounts User"):
+			for u in (cls.owner, cls.other, cls.admin):
+				_give_role(u, "Accounts User")
+		# State-independence on a shared bench site: the manual/scheduled run budget
+		# (_over_run_budget) enforces a TENANT-WIDE monthly ceiling that counts every
+		# NON-FAILED Jarvis Agent Run across the whole site — including residue other
+		# platform-test modules leave behind (their record_delegate_run commits
+		# mid-test, so FrappeTestCase cannot roll those rows back). That aggregate can
+		# refuse this module's legitimate run_agent_now dispatch ("Monthly agent-run
+		# budget reached") even though this module cleans its OWN runs every setUp.
+		# None of these tests exercise the budget-exceeded path, so lift the budget
+		# out of the way for the module and restore it in tearDownClass — the tests
+		# then assert identity/authZ, not another module's leftover row count.
+		cls._orig_run_budget = frappe.db.get_single_value("Jarvis Settings", "agent_run_budget_monthly")
+		frappe.db.set_single_value("Jarvis Settings", "agent_run_budget_monthly", 1000000)
+		frappe.db.commit()
+
+	@classmethod
+	def tearDownClass(cls):
+		frappe.set_user("Administrator")
+		frappe.db.set_single_value(
+			"Jarvis Settings", "agent_run_budget_monthly", getattr(cls, "_orig_run_budget", None)
+		)
+		frappe.db.commit()
+		super().tearDownClass()
+
+	def setUp(self):
+		frappe.set_user("Administrator")
+		# Clean this test's installs/runs/findings/activity so reruns are
+		# deterministic (install_agent/log_activity commit; FrappeTestCase's
+		# rollback cannot reclaim them).
+		for dt in (FINDING, RUN, ACTIVITY, INSTALLATION):
+			for owner in (self.owner, self.other, self.admin):
+				for n in frappe.get_all(dt, filters={"owner": owner}, pluck="name"):
+					frappe.delete_doc(dt, n, force=True, ignore_permissions=True)
+		# jarvis#1062: access is DENY BY DEFAULT, so clearing the allow rows is no
+		# longer a way to make the catalog reachable - it is how you CLOSE it. Reset
+		# to a known state, then grant this module's cast by name so the tests whose
+		# subject is NOT access control (install, run, schedule, push) reach the code
+		# they mean to exercise. The RBAC tests below narrow it again via _restrict.
+		clear_listing_access()
+		for slug in _MODULE_SLUGS:
+			for u in (self.owner, self.other, self.admin):
+				allow_listing_for(slug, user=u)
+		frappe.db.commit()
+
+	def tearDown(self):
+		frappe.set_user("Administrator")
+
+	# ------------------------------------------------------------------ #
+	# (a) THE scheduler-identity regression test (S1)
+	# ------------------------------------------------------------------ #
+	def test_scheduled_run_owner_is_installation_owner_never_administrator(self):
+		inst_name = _install_as(self.owner, "close-auditor")
+		frappe.db.set_value(INSTALLATION, inst_name, "enabled", 1)
+		frappe.db.commit()
+		inst = frappe.get_doc(INSTALLATION, inst_name)
+
+		# Drive the scheduler's exact launch path AS the owner (what
+		# run_due_agent_audits does inside set_user(owner)). Stub the delegate
+		# dispatch (admin -> fleet) so no real admin/agent is needed.
+		import jarvis.admin_client as admin_client
+
+		orig_run = admin_client.post_agent_run
+		admin_client.post_agent_run = lambda **kw: {"run_id": kw.get("run_id"), "status": "queued"}
+		original_user = frappe.session.user
+		try:
+			frappe.set_user(self.owner)
+			result = agent_scheduler._launch_audit(inst, trigger="scheduled")
+		finally:
+			frappe.set_user(original_user)
+			admin_client.post_agent_run = orig_run
+
+		conv = result["conversation"]
+		run = result["run"]
+		conv_owner = frappe.db.get_value("Jarvis Conversation", conv, "owner")
+		run_owner = frappe.db.get_value(RUN, run, "owner")
+		self.assertEqual(conv_owner, self.owner)
+		self.assertNotEqual(conv_owner, "Administrator")
+		self.assertEqual(run_owner, self.owner)
+		self.assertNotEqual(run_owner, "Administrator")
+
+	def test_fail_closed_guard_rejects_administrator_owner(self):
+		# The identity guard must refuse Administrator / Guest / disabled users.
+		self.assertFalse(agent_scheduler._valid_owner("Administrator"))
+		self.assertFalse(agent_scheduler._valid_owner("Guest"))
+		self.assertTrue(agent_scheduler._valid_owner(self.owner))
+
+	def test_run_agent_now_executes_as_owner_not_triggering_admin(self):
+		# A System Manager (Administrator) triggering ANOTHER owner's audit must
+		# dispatch the turn under the OWNER's identity — so jarvis__* tool calls
+		# are scoped to the owner's permissions, not the admin's (the manual-path
+		# analogue of the S1 scheduler hinge).
+		inst_name = _install_as(self.owner, "close-auditor")
+		frappe.db.set_value(INSTALLATION, inst_name, "enabled", 1)
+		frappe.db.commit()
+
+		import jarvis.admin_client as admin_client
+
+		captured = {}
+		orig_run = admin_client.post_agent_run
+
+		def _cap(**kw):
+			captured["user"] = frappe.session.user
+			return {"run_id": kw.get("run_id"), "status": "queued"}
+
+		admin_client.post_agent_run = _cap
+		original_user = frappe.session.user
+		try:
+			frappe.set_user("Administrator")  # a System Manager triggers someone else's audit
+			result = agents_api.run_agent_now(inst_name)
+		finally:
+			frappe.set_user(original_user)
+			admin_client.post_agent_run = orig_run
+
+		# The turn was dispatched while the session was the OWNER, not Administrator.
+		self.assertEqual(captured.get("user"), self.owner)
+		conv_owner = frappe.db.get_value("Jarvis Conversation", result["data"]["conversation"], "owner")
+		self.assertEqual(conv_owner, self.owner)
+		self.assertNotEqual(conv_owner, "Administrator")
+
+	def _run_now_on_unapplied_agent(self, *, owner, run_as):
+		"""Shared drive for the "not an installed delegate" translation (jarvis#1062
+		D1): install as ``owner``, then redirect run_as_user to ``run_as`` - a
+		DIFFERENT identity when the two diverge, which is what pins the fix.
+		``_launch_audit`` runs impersonated AS run_as (R1-F3: deliberately
+		decoupled from the owner), so a caller passing owner != run_as proves the
+		message follows the OWNER (who actually reads it back on the Runs board),
+		never the impersonated session. Stubs the fleet 502 and asserts the Run
+		lands terminal FAILED with the translated message (never a raw 500 or a
+		stuck "running" row). Returns (raised exception message, persisted
+		run.error)."""
+		inst_name = _install_as(owner, "close-auditor")
+		frappe.db.set_value(INSTALLATION, inst_name, "run_as_user", run_as, update_modified=False)
+		if run_as != owner:
+			# A run-as user other than the owner is only honoured when the record says
+			# an Administrator or System Manager set it, so leave the same activity row
+			# the controller writes for a cross-user mapping.
+			from jarvis.chat.agent_activity import log_activity
+
+			log_activity(
+				agent="close-auditor",
+				agent_title=None,
+				installation=inst_name,
+				action="run_as_changed",
+				detail=f"run as {run_as} (set by Administrator)",
+				owner=owner,
+			)
+		frappe.db.set_value(INSTALLATION, inst_name, "enabled", 1)
+		agent = frappe.db.get_value(INSTALLATION, inst_name, "agent")
+		frappe.db.commit()
+
+		import jarvis.admin_client as admin_client
+		from jarvis.exceptions import AdminUnreachableError
+
+		orig_run = admin_client.post_agent_run
+
+		def _not_installed(**kw):
+			raise AdminUnreachableError(
+				"admin returned a 502 error: invalid_spec: agent_id "
+				f"'{kw.get('agent_id')}' is not an installed delegate on jarvis-pool-test"
+			)
+
+		admin_client.post_agent_run = _not_installed
+		try:
+			with self.assertRaises(frappe.ValidationError) as ctx:
+				agents_api.run_agent_now(inst_name)
+		finally:
+			admin_client.post_agent_run = orig_run
+
+		# The run must be terminal FAILED (never left stuck "running") and carry the
+		# same actionable message, not a raw fleet 502.
+		run = frappe.get_all(
+			RUN,
+			filters={"agent": agent, "owner": owner},
+			fields=["status", "error"],
+			order_by="creation desc",
+			limit=1,
+		)
+		self.assertTrue(run)
+		self.assertEqual(run[0].status, "failed")
+		return str(ctx.exception), run[0].error or ""
+
+	def test_run_now_on_unapplied_agent_follows_the_owner_not_the_impersonated_run_as(self):
+		# self.admin (System Manager, a reviewer) OWNS the install; the RUN-AS
+		# identity _launch_audit impersonates is self.owner (ROLE_X only, NOT a
+		# reviewer). The copy must still be the actionable reviewer copy, because
+		# it follows the OWNER - a regression back to frappe.session.user (the
+		# impersonated run-as) would flip this to the non-reviewer copy instead.
+		exc_msg, run_error = self._run_now_on_unapplied_agent(owner=self.admin, run_as=self.owner)
+		self.assertIn("Apply catalog changes", exc_msg)
+		self.assertIn("Apply catalog changes", run_error)
+
+	def test_run_now_on_unapplied_agent_tells_a_non_reviewer_owner_to_ask_an_admin(self):
+		# self.owner (ROLE_X only, NOT a reviewer) OWNS the install; the RUN-AS
+		# identity _launch_audit impersonates is self.admin (a reviewer). The
+		# message must still be the non-reviewer copy, because it follows the
+		# OWNER - proving the branch does not read the impersonated run-as
+		# session even when THAT identity happens to be a reviewer.
+		exc_msg, run_error = self._run_now_on_unapplied_agent(owner=self.owner, run_as=self.admin)
+		self.assertNotIn("Apply catalog changes", exc_msg)
+		self.assertIn("Ask your administrator", exc_msg)
+		self.assertNotIn("Apply catalog changes", run_error)
+		self.assertIn("Ask your administrator", run_error)
+
+	# ------------------------------------------------------------------ #
+	# (a2) Phase 2C — delegate dispatch routes through admin, not chat
+	# ------------------------------------------------------------------ #
+	def test_delegate_dispatch_calls_post_agent_run_not_send_message(self):
+		inst_name = _install_as(self.owner, "close-auditor")  # delivery=delegate
+		frappe.db.set_value(INSTALLATION, inst_name, "enabled", 1)
+		frappe.db.commit()
+		inst = frappe.get_doc(INSTALLATION, inst_name)
+
+		import jarvis.admin_client as admin_client
+		import jarvis.chat.api as chat_api
+
+		captured = {}
+
+		def _cap(**kw):
+			captured.update(kw)
+			return {"run_id": kw.get("run_id"), "status": "queued"}
+
+		def _no_send(**kw):
+			raise AssertionError("send_message must NOT be called for a delegate")
+
+		orig_run, orig_send = admin_client.post_agent_run, chat_api.send_message
+		admin_client.post_agent_run = _cap
+		chat_api.send_message = _no_send
+		original_user = frappe.session.user
+		try:
+			frappe.set_user(self.owner)
+			result = agent_scheduler._launch_audit(inst, trigger="scheduled")
+		finally:
+			frappe.set_user(original_user)
+			admin_client.post_agent_run = orig_run
+			chat_api.send_message = orig_send
+
+		run = result["run"]
+		self.assertEqual(captured.get("run_id"), run)
+		self.assertEqual(captured.get("agent_id"), "agent-close-auditor")
+		self.assertEqual(captured.get("session_key"), result["session_key"])
+		self.assertTrue(captured.get("session_key").startswith("agent:agent-close-auditor:"))
+		# timeout_s sourced from the bundled registry (close-auditor = 2400).
+		self.assertEqual(captured.get("timeout_s"), 2400)
+		# Async: the Run stays "running" post-dispatch (Phase 3 writeback marks done).
+		self.assertEqual(frappe.db.get_value(RUN, run, "status"), "running")
+		# The generic prompt is NON-LEAKY (no rule/tool/threshold names).
+		msg = captured.get("message") or ""
+		for leak in ("jarvis__", "rule_id", "rule_pack", "pl_balance", "bs_balance", "$"):
+			self.assertNotIn(leak, msg)
+		self.assertIn(inst_name, msg)  # installation pointer for the config
+
+	def test_delegate_dispatch_failure_marks_run_failed_and_reraises(self):
+		inst_name = _install_as(self.owner, "close-auditor")
+		frappe.db.set_value(INSTALLATION, inst_name, "enabled", 1)
+		frappe.db.commit()
+		inst = frappe.get_doc(INSTALLATION, inst_name)
+
+		import jarvis.admin_client as admin_client
+
+		def _boom(**kw):
+			raise RuntimeError("admin unreachable")
+
+		orig_run = admin_client.post_agent_run
+		admin_client.post_agent_run = _boom
+		original_user = frappe.session.user
+		try:
+			frappe.set_user(self.owner)
+			with self.assertRaises(RuntimeError):
+				agent_scheduler._launch_audit(inst, trigger="scheduled")
+		finally:
+			frappe.set_user(original_user)
+			admin_client.post_agent_run = orig_run
+
+		# The already-created Run is marked failed (never orphaned as "running").
+		runs = frappe.get_all(RUN, filters={"installation": inst_name}, fields=["name", "status", "error"])
+		self.assertTrue(runs)
+		self.assertTrue(all(r.status == "failed" for r in runs))
+		self.assertTrue(any("dispatch failed" in (r.error or "") for r in runs))
+
+	def test_generic_prompt_is_non_leaky(self):
+		delegate = frappe.get_doc(LISTING, "close-auditor")
+		inst_name = _install_as(self.owner, "close-auditor")
+		inst = frappe.get_doc(INSTALLATION, inst_name)
+		scope = {
+			"company": "Test Co",
+			"fiscal_year": "2026-2027",
+			"from_date": "2026-04-01",
+			"to_date": "2027-03-31",
+			"report_date": "2026-09-11",
+			"prior_fy_start": "2025-04-01",
+			"prior_fy_end": "2026-03-31",
+		}
+		gen = agent_scheduler._audit_prompt(delegate, inst, "scheduled", scope)
+		# The bench-injected run message names NO rule/tool/threshold/engine.
+		for leak in ("jarvis__", "rule_id", "rule_pack", "pl_balance", "bs_balance", "$"):
+			self.assertNotIn(leak, gen)
+		self.assertIn("EXPLICIT SCOPE", gen)
+		self.assertIn("2026-04-01", gen)  # scope injected verbatim (A6)
+		self.assertIn("2026-09-11", gen)  # as-of report_date conveyed to the delegate
+		self.assertIn(inst_name, gen)  # installation pointer
+
+	def test_resolve_scope_injects_report_date_and_preserves_to_date(self):
+		"""to_date bounds the analysis window (may be a future FY end) and is left
+		as-is; report_date is the site's today, injected so a period-end finding can
+		cap due-ness at the as-of date instead of a future to_date."""
+		from jarvis.chat import agent_scope
+
+		company = frappe.db.get_value("Company", {}, "name")
+		if not company:
+			self.skipTest("no Company on the test site")
+		sc = agent_scope._resolve(company, None, "2026-04-01", "2027-03-31")
+		self.assertEqual(sc["to_date"], "2027-03-31")  # window preserved, never clamped
+		self.assertEqual(sc["report_date"], frappe.utils.today())  # as-of = site today
+
+	# ------------------------------------------------------------------ #
+	# (b) mutation authZ (S3)
+	# ------------------------------------------------------------------ #
+	def test_non_owner_cannot_set_enabled_another_owners_install(self):
+		inst_name = _install_as(self.owner, "close-auditor")
+		original_user = frappe.session.user
+		frappe.set_user(self.other)
+		try:
+			with self.assertRaises(frappe.PermissionError):
+				agents_api.set_enabled(inst_name, 1)
+		finally:
+			frappe.set_user(original_user)
+		# The install stays disabled — the non-owner write never landed.
+		self.assertEqual(int(frappe.db.get_value(INSTALLATION, inst_name, "enabled")), 0)
+
+	# ------------------------------------------------------------------ #
+	# (d) catalog sync idempotency
+	# ------------------------------------------------------------------ #
+	def test_sync_agent_listings_idempotent(self):
+		agent_catalog.sync_agent_listings()
+		count1 = frappe.db.count(LISTING)
+		r2 = agent_catalog.sync_agent_listings()
+		count2 = frappe.db.count(LISTING)
+		self.assertEqual(count1, count2)  # no dup rows on re-sync
+		self.assertEqual(r2["created"], 0)  # nothing created the second time
+		published = set(frappe.get_all(LISTING, filters={"status": "Published"}, pluck="name"))
+		self.assertIn("close-auditor", published)
+		# bank-recon-operator ships Published at 0.3.0 (proposals-only review).
+		self.assertEqual(frappe.db.get_value(LISTING, "bank-recon-operator", "status"), "Published")
+		# Every shipped agent is delegate and BODY-FREE: the proprietary SKILL must
+		# NEVER be stored in the customer DB (A2) — it lives only in the admin
+		# bundle store.
+		for slug in ("close-auditor", "bank-recon-operator"):
+			row = frappe.db.get_value(LISTING, slug, ["delivery", "skill_bundle"], as_dict=True)
+			self.assertEqual(row.delivery, "delegate")
+			bundle = frappe.parse_json(row.skill_bundle) or []
+			has_body = any((b or {}).get("body", "").strip() for b in bundle)
+			self.assertFalse(has_body, f"{slug} (delegate) leaked a skill body into the DB")
+
+	# ------------------------------------------------------------------ #
+	# (d3) jarvis#1062 polish: category derived from domain, mapped to a
+	# real label instead of a bare registry code
+	# ------------------------------------------------------------------ #
+	def test_category_from_domain_uses_the_real_label_map(self):
+		self.assertEqual(agent_catalog._category_from_domain("ap"), "Accounts Payable")
+		self.assertEqual(agent_catalog._category_from_domain("ar"), "Accounts Receivable")
+		self.assertEqual(agent_catalog._category_from_domain("crm"), "CRM")
+		self.assertEqual(agent_catalog._category_from_domain("hrms-payroll"), "HR and Payroll")
+		self.assertEqual(agent_catalog._category_from_domain("gst-compliance"), "GST Compliance")
+		self.assertEqual(agent_catalog._category_from_domain("inventory"), "Inventory")
+		self.assertEqual(agent_catalog._category_from_domain("accounting"), "Accounting")
+		self.assertEqual(agent_catalog._category_from_domain("close"), "Close and Reporting")
+		self.assertEqual(agent_catalog._category_from_domain("india-compliance"), "India Compliance")
+		self.assertEqual(agent_catalog._category_from_domain("measurement"), "Measurement")
+		self.assertEqual(agent_catalog._category_from_domain("inventory-count"), "Inventory Count")
+		self.assertEqual(agent_catalog._category_from_domain("bank-recon"), "Bank and Reconciliation")
+		self.assertEqual(agent_catalog._category_from_domain("tds-compliance"), "TDS Compliance")
+		self.assertEqual(agent_catalog._category_from_domain("helpdesk"), "Helpdesk")
+		self.assertEqual(agent_catalog._category_from_domain("knowledge"), "Knowledge Base")
+
+	def test_every_registry_domain_has_an_explicit_label_not_the_title_case_fallback(self):
+		"""Every ``domain`` the bundled registry actually declares must resolve
+		through ``_DOMAIN_CATEGORY_LABELS`` - the title-cased fallback exists for
+		a domain that has not shipped yet, never for a real one (a fallback label
+		reads worse: "Tds Compliance" instead of "TDS Compliance")."""
+		reg = agent_catalog._load_registry()
+		domains = {(a.get("domain") or "").strip().lower().replace("-", "_") for a in reg.get("agents") or []}
+		domains.discard("")
+		unmapped = domains - set(agent_catalog._DOMAIN_CATEGORY_LABELS)
+		self.assertEqual(unmapped, set(), f"registry domain(s) with no explicit category label: {unmapped}")
+
+	def test_category_from_domain_falls_back_to_title_case_for_unknown_codes(self):
+		self.assertEqual(agent_catalog._category_from_domain("widget-foo"), "Widget Foo")
+		self.assertEqual(agent_catalog._category_from_domain(""), "")
+		self.assertEqual(agent_catalog._category_from_domain(None), "")
+
+	def test_sync_agent_listings_writes_the_mapped_category_not_the_raw_domain(self):
+		agent_catalog.sync_agent_listings()
+		self.assertEqual(frappe.db.get_value(LISTING, "close-auditor", "category"), "Close and Reporting")
+		self.assertEqual(
+			frappe.db.get_value(LISTING, "bank-recon-operator", "category"), "Bank and Reconciliation"
+		)
+
+	# ------------------------------------------------------------------ #
+	# jarvis#1063 (jarvis-only half) - config_keys: which agent-specific
+	# installation config keys an agent's bundle actually reads (verified
+	# against jarvis-agents/agents/<slug>/evaluate.py; only close-auditor
+	# reads any today).
+	# ------------------------------------------------------------------ #
+	def test_sync_agent_listings_writes_config_keys_from_the_registry(self):
+		# dot paths - close-auditor/evaluate.py reads these NESTED under a
+		# top-level "materiality" object, not as flat top-level keys.
+		agent_catalog.sync_agent_listings()
+		self.assertEqual(
+			json.loads(frappe.db.get_value(LISTING, "close-auditor", "config_keys")),
+			[
+				"materiality.benchmark_value",
+				"materiality.percentage",
+				"materiality.engagement_risk_level",
+				"materiality.rounding_step",
+			],
+		)
+
+	def test_sync_agent_listings_defaults_config_keys_to_empty(self):
+		"""An agent the registry declares no config_keys for (everyone but
+		close-auditor today) gets [], not null/absent - ConfigForm.vue can
+		always safely parse it."""
+		agent_catalog.sync_agent_listings()
+		self.assertEqual(
+			json.loads(frappe.db.get_value(LISTING, "cycle-count-planner-operator", "config_keys")), []
+		)
+
+	def test_get_agent_returns_config_keys(self):
+		agent_catalog.sync_agent_listings()
+		frappe.set_user(self.owner)
+		try:
+			out = agents_api.get_agent("close-auditor")
+		finally:
+			frappe.set_user("Administrator")
+		self.assertEqual(
+			json.loads(out["config_keys"]),
+			[
+				"materiality.benchmark_value",
+				"materiality.percentage",
+				"materiality.engagement_risk_level",
+				"materiality.rounding_step",
+			],
+		)
+
+	def test_ap_detail_exposes_saved_configuration_readiness(self):
+		slug = "ap-3way-match-operator"
+		original_status = frappe.db.get_value(LISTING, slug, "status")
+		original_roles = [row.role for row in frappe.get_doc("User", self.admin).roles]
+		try:
+			for role in ("Purchase User", "Stock User"):
+				_give_role(self.admin, role)
+			frappe.db.set_value(LISTING, slug, "status", "Published")
+			installation = _install_as(self.admin, slug)
+			frappe.set_user(self.admin)
+			agents_api.set_config(installation, json.dumps({"company": "Example"}))
+			detail = agents_api.get_agent(slug)
+			self.assertEqual(
+				set(detail["installation"]["configuration_issues"]),
+				{
+					"from_date",
+					"to_date",
+					"report_date",
+					"policy_version",
+					"price_tolerance_percent",
+					"basis",
+					"review_scope",
+				},
+			)
+			policy = {
+				"company": "Example",
+				"from_date": "2020-01-01",
+				"to_date": "2020-12-31",
+				"report_date": "2020-12-31",
+				"policy_version": "AP-review-v1",
+				"price_tolerance_percent": 0,
+				"basis": "current_records",
+				"review_scope": "document_matching_only",
+			}
+			agents_api.set_config(installation, json.dumps(policy))
+			self.assertEqual(agents_api.get_agent(slug)["installation"]["configuration_issues"], {})
+		finally:
+			frappe.set_user("Administrator")
+			frappe.db.set_value(LISTING, slug, "status", original_status)
+			user = frappe.get_doc("User", self.admin)
+			user.set("roles", [{"role": role} for role in original_roles])
+			user.save()
+			frappe.db.commit()
+
+	# ------------------------------------------------------------------ #
+	# jarvis#1062 E2E defect: turning a schedule off left the last computed
+	# next_run_at in place, so the Configure tab kept showing a stale
+	# "Next run: ..." line after disabling the schedule.
+	# ------------------------------------------------------------------ #
+	def test_set_schedule_clears_next_run_at_when_disabled(self):
+		inst = _install_as(self.owner, "close-auditor")
+		frappe.set_user(self.owner)
+		try:
+			on = agents_api.set_schedule(
+				inst, schedule_enabled=1, schedule_frequency="daily", schedule_time="09:00"
+			)
+			self.assertTrue(on["data"]["next_run_at"])
+			self.assertTrue(frappe.db.get_value(INSTALLATION, inst, "next_run_at"))
+
+			off = agents_api.set_schedule(inst, schedule_enabled=0)
+		finally:
+			frappe.set_user("Administrator")
+		self.assertIsNone(off["data"]["next_run_at"])
+		self.assertIsNone(frappe.db.get_value(INSTALLATION, inst, "next_run_at"))
+
+	# ------------------------------------------------------------------ #
+	# jarvis#1063 CRITICAL fix: close-auditor/evaluate.py reads its
+	# materiality inputs NESTED under a top-level "materiality" object
+	# (config["materiality"]["benchmark_value"], etc.), not as flat
+	# top-level keys. set_config is a generic passthrough - this just
+	# guards that the bench does not flatten/mangle a nested payload on
+	# the way to storage, which the delegate reads verbatim.
+	# ------------------------------------------------------------------ #
+	def test_set_config_persists_a_nested_materiality_object_unchanged(self):
+		inst = _install_as(self.owner, "close-auditor")
+		payload = {
+			"company": "Acme Ltd",
+			"materiality": {
+				"benchmark_value": 1000000,
+				"percentage": 5,
+				"engagement_risk_level": "medium",
+				"rounding_step": 100,
+			},
+		}
+		frappe.set_user(self.owner)
+		try:
+			agents_api.set_config(inst, json.dumps(payload))
+		finally:
+			frappe.set_user("Administrator")
+		stored = json.loads(frappe.db.get_value(INSTALLATION, inst, "config"))
+		self.assertEqual(stored, payload)
+
+	# ------------------------------------------------------------------ #
+	# (d4) jarvis#1062 polish: Published operator listings with no dispatch
+	# path were flipped to Coming Soon in the registry; a re-sync must carry
+	# an already-deployed Published row down with it.
+	# ------------------------------------------------------------------ #
+	def test_dispatchless_operators_downgrade_to_coming_soon_on_resync(self):
+		operator_slugs = [
+			"cycle-count-planner-operator",
+			"reorder-replenishment-operator",
+		]
+		agent_catalog.sync_agent_listings()
+		# Simulate the pre-change deployed state, as if synced before the flip.
+		for slug in operator_slugs:
+			frappe.db.set_value(LISTING, slug, "status", "Published", update_modified=False)
+		frappe.db.commit()
+
+		agent_catalog.sync_agent_listings()
+
+		for slug in operator_slugs:
+			self.assertEqual(
+				frappe.db.get_value(LISTING, slug, "status"),
+				"Coming Soon",
+				f"{slug} must follow the registry's Coming Soon status on re-sync",
+			)
+
+	def test_ap_ar_review_operators_publish_on_resync(self):
+		operator_slugs = ("ap-3way-match-operator", "ar-collections-operator")
+		for slug in operator_slugs:
+			frappe.db.set_value(LISTING, slug, "status", "Coming Soon", update_modified=False)
+
+		agent_catalog.sync_agent_listings()
+
+		for slug in operator_slugs:
+			self.assertEqual(frappe.db.get_value(LISTING, slug, "status"), "Published")
+
+	# ------------------------------------------------------------------ #
+	# (d2) Phase 0A — delegate agent stub + body-free enablement signal
+	# ------------------------------------------------------------------ #
+	def test_delegate_agent_ships_stub_and_enablement_signal(self):
+		"""A2 / Phase 0A: a delegate agent's SKILL body NEVER enters the customer
+		DB, and its push-payload entry is a body-free ENABLEMENT SIGNAL that the
+		admin relay (Phase 2C) routes by ``delivery == 'delegate'`` — carrying
+		tools_allow / timeout_s / nature / model looked up from the bundled
+		registry, no proprietary body."""
+		DELEGATE = "close-auditor"
+		# The Listing stub carries the metadata but NOT the body.
+		row = frappe.db.get_value(LISTING, DELEGATE, ["delivery", "skill_bundle"], as_dict=True)
+		self.assertEqual(row.delivery, "delegate")
+		bundle = frappe.parse_json(row.skill_bundle) or []
+		self.assertFalse(
+			any((b or {}).get("body", "").strip() for b in bundle),
+			"delegate agent leaked a SKILL body into the customer DB",
+		)
+
+		# Install + enable for an owner who can read what it scans (A12), so the
+		# enablement signal is emitted rather than skipped. Accounts User grants
+		# read on GL Entry / Account / Company.
+		if frappe.db.exists("Role", "Accounts User"):
+			_give_role(self.owner, "Accounts User")
+		inst = _install_as(self.owner, DELEGATE)
+		frappe.db.set_value(INSTALLATION, inst, "enabled", 1)
+		frappe.db.commit()
+
+		payload = agent_catalog.build_agent_push_payload(owner=self.owner)
+		sig = next(p for p in payload if p["slug"] == f"agent-{DELEGATE}")
+		self.assertEqual(sig["delivery"], "delegate")
+		self.assertNotIn("body", sig)  # body-free — the whole point
+		self.assertEqual(sig["nature"], "auditor")
+		self.assertEqual(sig["timeout_s"], 2400)
+		self.assertIn("model", sig)  # present (may be None) so 2C can default it
+		self.assertIn("exec", sig["tools_allow"])
+		self.assertIn("jarvis__get_balance_on", sig["tools_allow"])
+
+	# ------------------------------------------------------------------ #
+	# (e) RBAC — role-gated install / run (server-side enforcement)
+	# ------------------------------------------------------------------ #
+	def _restrict(self, slug: str, roles: list) -> None:
+		"""Set the listing's access to exactly ``roles`` and NO named users.
+
+		Both halves, because setUp grants this module's cast by name: leaving those
+		rows in place would make every "restricted to ROLE_X" assertion below pass
+		for a reason that has nothing to do with the role."""
+		original = frappe.session.user
+		frappe.set_user("Administrator")
+		try:
+			agents_api.set_agent_access(slug, roles=roles, users=[])
+		finally:
+			frappe.set_user(original)
+
+	def test_role_gated_install(self):
+		self._restrict("close-auditor", [ROLE_X])
+
+		# User WITHOUT the role: server-side PermissionError, no row created.
+		frappe.set_user(self.other)
+		try:
+			with self.assertRaises(frappe.PermissionError):
+				agents_api.install_agent("close-auditor")
+		finally:
+			frappe.set_user("Administrator")
+		self.assertFalse(frappe.db.exists(INSTALLATION, {"owner": self.other, "agent": "close-auditor"}))
+
+		# User WITH the role installs fine.
+		inst = _install_as(self.owner, "close-auditor")
+		self.assertTrue(frappe.db.exists(INSTALLATION, inst))
+
+		# A System Manager (who does NOT hold ROLE_X) is always allowed.
+		inst_admin = _install_as(self.admin, "close-auditor")
+		self.assertTrue(frappe.db.exists(INSTALLATION, inst_admin))
+
+	def test_role_gated_run_agent_now(self):
+		# Install + enable while UNRESTRICTED, then restrict — the run gate must
+		# catch an owner whose roles no longer permit the agent.
+		inst_other = _install_as(self.other, "close-auditor")
+		frappe.db.set_value(INSTALLATION, inst_other, "enabled", 1)
+		inst_owner = _install_as(self.owner, "close-auditor")
+		frappe.db.set_value(INSTALLATION, inst_owner, "enabled", 1)
+		frappe.db.commit()
+		self._restrict("close-auditor", [ROLE_X])
+
+		# Delegates dispatch via admin_client.post_agent_run (never chat send).
+		import jarvis.admin_client as admin_client
+
+		calls = []
+		orig_run = admin_client.post_agent_run
+		admin_client.post_agent_run = lambda **kw: (
+			calls.append(frappe.session.user) or {"run_id": kw.get("run_id"), "status": "queued"}
+		)
+		try:
+			# self.other lacks ROLE_X -> refused, and NO turn was dispatched.
+			frappe.set_user(self.other)
+			with self.assertRaises(frappe.PermissionError):
+				agents_api.run_agent_now(inst_other)
+			self.assertEqual(calls, [])
+
+			# self.owner holds ROLE_X -> runs (dispatched as the run-as user).
+			frappe.set_user(self.owner)
+			result = agents_api.run_agent_now(inst_owner)
+			self.assertTrue(result["ok"])
+			self.assertEqual(calls, [self.owner])
+		finally:
+			frappe.set_user("Administrator")
+			admin_client.post_agent_run = orig_run
+
+	def test_list_agents_allowed_flags_and_roles_roundtrip(self):
+		# jarvis#1062 D2 (revised): list_agents (via _enriched_catalog) now
+		# HIDES a role-restricted row for a non-admin who has NOT installed
+		# it, instead of returning it disabled with allowed=0 - a blocked,
+		# never-installed user gets no row at all (an already-installed row
+		# survives a later restriction regardless - see
+		# test_installed_row_survives_a_role_revoked_after_install). An admin
+		# keeps EXACT parity with pre-D2 behavior: every row, `allowed`
+		# computed the same way, `allowed_roles` still present.
+		res = None
+		frappe.set_user("Administrator")
+		# set_agent_ACCESS, not the set_agent_roles shim: the shim preserves
+		# allowed_users by design, and setUp grants this module's cast by name -
+		# so the shim would leave self.other named and the "blocked" assertion
+		# below would pass on a listing that in fact still admits them.
+		res = agents_api.set_agent_access("close-auditor", roles=[ROLE_X], users=[])
+		self.assertEqual(res["allowed_roles"], [ROLE_X])
+
+		def _row(user):
+			frappe.set_user(user)
+			try:
+				return next((r for r in agents_api.list_agents() if r["name"] == "close-auditor"), None)
+			finally:
+				frappe.set_user("Administrator")
+
+		# self.other never installed close-auditor (setUp clears installs) and
+		# lacks ROLE_X -> hidden.
+		blocked = _row(self.other)
+		self.assertIsNone(
+			blocked, "a role-restricted, never-installed row must be HIDDEN from a blocked user"
+		)
+
+		permitted = _row(self.owner)
+		self.assertIsNotNone(permitted)
+		self.assertEqual(permitted["allowed"], 1)
+		# non-admin payload: allowed_roles is stripped entirely (D2 knock-on) —
+		# nothing left for the removed "Available to: ..." card branch to read.
+		self.assertNotIn("allowed_roles", permitted)
+
+		sm = _row(self.admin)  # System Manager: admin parity — sees the row + allowed_roles
+		self.assertIsNotNone(sm)
+		self.assertEqual(sm["allowed"], 1)
+		self.assertEqual(sm["allowed_roles"], [ROLE_X])
+
+		# jarvis#1062: clearing the roles no longer means "unrestricted". With no
+		# roles and no users the listing is CLOSED, so the blocked user stays hidden
+		# - this is the inversion, asserted directly.
+		res = agents_api.set_agent_access("close-auditor", roles=[], users=[])
+		self.assertEqual(res["allowed_roles"], [])
+		self.assertEqual(res["allowed_users"], [])
+		self.assertIsNone(
+			_row(self.other),
+			"clearing every grant CLOSES the listing; it must not reopen it to everyone",
+		)
+		# An admin still sees it (admin parity), and still sees the empty roster.
+		closed_for_admin = _row(self.admin)
+		self.assertIsNotNone(closed_for_admin)
+		self.assertEqual(closed_for_admin["allowed"], 1)
+		self.assertEqual(closed_for_admin["allowed_roles"], [])
+
+		# Naming the user directly is the OTHER way in - no role involved.
+		agents_api.set_agent_access("close-auditor", roles=[], users=[self.other])
+		by_name = _row(self.other)
+		self.assertIsNotNone(by_name, "a user named in allowed_users must see the row")
+		self.assertEqual(by_name["allowed"], 1)
+		self.assertNotIn("allowed_users", by_name)  # roster is admin-only
+
+	def test_draft_listing_hidden_from_non_admin_unless_installed(self):
+		# jarvis#1062 D2: Draft is a registry-only lifecycle state (never
+		# shipped) a non-admin should not browse to before an admin publishes
+		# it — but an installed instance must not vanish out from under its own
+		# installer. (Coming Soon is a DIFFERENT case — see
+		# test_coming_soon_listing_is_discoverable_but_draft_is_not — it is the
+		# SPA's deliberate teaser and stays visible to everyone.)
+		_install_as(self.owner, "close-auditor")
+		frappe.db.set_value(LISTING, "close-auditor", "status", "Draft")
+		frappe.db.commit()
+
+		def _row(user):
+			frappe.set_user(user)
+			try:
+				return next((r for r in agents_api.list_agents() if r["name"] == "close-auditor"), None)
+			finally:
+				frappe.set_user("Administrator")
+
+		try:
+			# self.other never installed it -> hidden while Draft.
+			self.assertIsNone(_row(self.other))
+			# self.owner installed it -> stays visible to its own installer.
+			self.assertIsNotNone(_row(self.owner))
+			# Admin parity: unaffected by the Draft-hiding rule.
+			self.assertIsNotNone(_row(self.admin))
+		finally:
+			frappe.db.set_value(LISTING, "close-auditor", "status", "Published")
+			frappe.db.commit()
+
+	def test_coming_soon_listing_is_discoverable_but_draft_is_not(self):
+		# jarvis#1062 D2 (review fix): D2's original cut hid EVERY non-Published,
+		# not-installed row, which also hid Coming Soon - the SPA is explicitly
+		# built to show it as a teaser (AgentsList's "Coming Soon" badge,
+		# AgentDetail's "Coming soon" install tooltip). Coming Soon must be
+		# discoverable by a non-admin who never installed it; Draft must not.
+		frappe.db.set_value(LISTING, "close-auditor", "status", "Coming Soon")
+		frappe.db.commit()
+
+		def _row(user):
+			frappe.set_user(user)
+			try:
+				return next((r for r in agents_api.list_agents() if r["name"] == "close-auditor"), None)
+			finally:
+				frappe.set_user("Administrator")
+
+		try:
+			# self.other never installed it -> still visible (Coming Soon is
+			# discoverable), and get_agent reads it too (never installed, never
+			# role-restricted here).
+			row = _row(self.other)
+			self.assertIsNotNone(row, "a Coming Soon listing must be discoverable, not hidden")
+			self.assertEqual(row["status"], "Coming Soon")
+			frappe.set_user(self.other)
+			try:
+				out = agents_api.get_agent("close-auditor")
+			finally:
+				frappe.set_user("Administrator")
+			self.assertEqual(out["status"], "Coming Soon")
+
+			# Draft, by contrast, still hides for the same never-installed caller.
+			frappe.db.set_value(LISTING, "close-auditor", "status", "Draft")
+			frappe.db.commit()
+			self.assertIsNone(_row(self.other))
+			frappe.set_user(self.other)
+			try:
+				with self.assertRaises(frappe.PermissionError):
+					agents_api.get_agent("close-auditor")
+			finally:
+				frappe.set_user("Administrator")
+		finally:
+			frappe.db.set_value(LISTING, "close-auditor", "status", "Published")
+			frappe.db.commit()
+
+	def test_installed_row_survives_a_role_revoked_after_install(self):
+		# jarvis#1062 D2 (revised): role gating governs DISCOVERY and RUNNING,
+		# not managing what you already installed — otherwise a role revoked
+		# after install stranded the owner with no UI path to uninstall it.
+		# self.other installs while ALLOWED (setUp grants this module's cast by
+		# name), then the listing is narrowed to a role self.other does not hold.
+		inst_name = _install_as(self.other, "close-auditor")
+		self._restrict("close-auditor", [ROLE_X])
+		try:
+			frappe.set_user(self.other)
+			try:
+				# still listed - honestly disabled (allowed=0), not hidden.
+				row = next((r for r in agents_api.list_agents() if r["name"] == "close-auditor"), None)
+				self.assertIsNotNone(row, "an installed row must survive a role revoked after install")
+				self.assertEqual(row["allowed"], 0)
+
+				# still readable.
+				out = agents_api.get_agent("close-auditor")
+				self.assertEqual(out["agent_slug"], "close-auditor")
+				self.assertEqual(out["allowed"], 0)
+
+				# still uninstallable (uninstall is owner-gated, never
+				# allowed_roles-gated - the one way out of the stranded state).
+				res = agents_api.uninstall_agent(inst_name)
+				self.assertTrue(res["ok"])
+				self.assertFalse(frappe.db.exists(INSTALLATION, inst_name))
+			finally:
+				frappe.set_user("Administrator")
+		finally:
+			self._restrict("close-auditor", [])
+
+	def test_get_agent_throws_permission_error_when_hidden(self):
+		# Role-restricted: a caller outside the allowed set gets a PermissionError,
+		# not a 404 or a quiet payload — the same visibility the catalog enforces.
+		self._restrict("close-auditor", [ROLE_X])
+		try:
+			frappe.set_user(self.other)  # lacks ROLE_X
+			try:
+				with self.assertRaises(frappe.PermissionError):
+					agents_api.get_agent("close-auditor")
+			finally:
+				frappe.set_user("Administrator")
+			# self.owner holds ROLE_X -> still readable.
+			frappe.set_user(self.owner)
+			try:
+				out = agents_api.get_agent("close-auditor")
+			finally:
+				frappe.set_user("Administrator")
+			self.assertEqual(out["agent_slug"], "close-auditor")
+		finally:
+			# Re-grant rather than merely clearing: under deny-by-default an empty
+			# pair is itself a refusal, and the Draft assertion below would then pass
+			# for the wrong reason - on the status gate it is not testing.
+			self._restrict("close-auditor", ["Jarvis User"])
+
+		# Draft + never installed by this caller -> also a PermissionError.
+		frappe.db.set_value(LISTING, "close-auditor", "status", "Draft")
+		frappe.db.commit()
+		try:
+			frappe.set_user(self.other)
+			try:
+				with self.assertRaises(frappe.PermissionError):
+					agents_api.get_agent("close-auditor")
+			finally:
+				frappe.set_user("Administrator")
+			# Admin parity: a System Manager still reads it fine while Draft.
+			frappe.set_user(self.admin)
+			try:
+				out = agents_api.get_agent("close-auditor")
+			finally:
+				frappe.set_user("Administrator")
+			self.assertEqual(out["status"], "Draft")
+		finally:
+			frappe.db.set_value(LISTING, "close-auditor", "status", "Published")
+			frappe.db.commit()
+
+	# ------------------------------------------------------------------ #
+	# (f) RBAC — admin endpoints are System Manager ONLY
+	# ------------------------------------------------------------------ #
+	def test_admin_endpoints_reject_non_system_manager(self):
+		frappe.set_user(self.other)
+		try:
+			with self.assertRaises(frappe.PermissionError):
+				agents_api.set_agent_roles("close-auditor", [ROLE_X])
+			with self.assertRaises(frappe.PermissionError):
+				agents_api.set_listing_status("close-auditor", "Deprecated")
+			with self.assertRaises(frappe.PermissionError):
+				agents_api.get_agent_admin_overview()
+		finally:
+			frappe.set_user("Administrator")
+		# Nothing leaked through: listing untouched.
+		self.assertEqual(frappe.db.get_value(LISTING, "close-auditor", "status"), "Published")
+		self.assertEqual(frappe.get_all(ALLOWED_ROLE, filters={"parent": "close-auditor"}, pluck="role"), [])
+
+	def test_set_listing_status_valid_and_invalid(self):
+		frappe.set_user(self.admin)  # a real SM user, not Administrator
+		try:
+			res = agents_api.set_listing_status("close-auditor", "Coming Soon")
+			self.assertEqual(res["status"], "Coming Soon")
+			self.assertEqual(frappe.db.get_value(LISTING, "close-auditor", "status"), "Coming Soon")
+			with self.assertRaises(frappe.ValidationError):
+				agents_api.set_listing_status("close-auditor", "Draft")  # registry-only
+			with self.assertRaises(frappe.ValidationError):
+				agents_api.set_listing_status("close-auditor", "bogus")
+		finally:
+			frappe.set_user("Administrator")
+			agents_api.set_listing_status("close-auditor", "Published")  # restore
+
+	def test_get_agent_admin_overview_shape(self):
+		inst = _install_as(self.owner, "close-auditor")
+		frappe.set_user("Administrator")
+		agents_api.set_agent_roles("close-auditor", [ROLE_X])
+
+		frappe.set_user(self.admin)
+		try:
+			out = agents_api.get_agent_admin_overview()
+		finally:
+			frappe.set_user("Administrator")
+
+		for excluded in ("Administrator", "Guest", "All"):
+			self.assertNotIn(excluded, out["roles"])
+		self.assertIn(ROLE_X, out["roles"])
+
+		row = next(l for l in out["listings"] if l["agent_slug"] == "close-auditor")
+		self.assertEqual(row["allowed_roles"], [ROLE_X])
+		# jarvis#1062: the overview feeds the admin Access editor, so it must carry
+		# BOTH halves of the grant. The named grants come from setUp; the shim above
+		# preserves them, which is the behaviour a cached older SPA build depends on.
+		self.assertIn("allowed_users", row)
+		self.assertIn(self.owner, row["allowed_users"])
+		self.assertEqual(row["status"], "Published")
+		install_row = next(i for i in row["installs"] if i["installation"] == inst)
+		self.assertEqual(install_row["owner"], self.owner)
+		for key in (
+			"enabled",
+			"run_as_user",
+			"schedule_enabled",
+			"schedule_frequency",
+			"next_run_at",
+			"last_run_at",
+			"sync_status",
+		):
+			self.assertIn(key, install_row)
+
+	def test_admin_overview_surfaces_run_as_user_including_blank(self):
+		"""R1-S2: the cross-owner Admin feed carries the EXECUTING identity, so an
+		admin reading an Apply/run failure can see WHICH install is misconfigured
+		without dropping to raw Desk. A blank one must arrive as a falsy value (the
+		badge case), not be omitted."""
+		good = self._enable_for(self.owner, "close-auditor")
+		legacy = self._make_legacy_enabled(self.other, "close-auditor")
+
+		frappe.set_user(self.admin)  # a System Manager
+		try:
+			out = agents_api.get_agent_admin_overview()
+		finally:
+			frappe.set_user("Administrator")
+
+		rows = {i["installation"]: i for lst in out["listings"] for i in lst["installs"]}
+		self.assertEqual(rows[good]["run_as_user"], self.owner)
+		self.assertIn(legacy, rows)
+		self.assertFalse(rows[legacy]["run_as_user"])
+
+	# ------------------------------------------------------------------ #
+	# (g) RBAC — scheduler skips an owner whose roles were revoked
+	# ------------------------------------------------------------------ #
+	def test_scheduler_skips_and_records_when_owner_lost_role(self):
+		from frappe.utils import add_days, now_datetime
+
+		inst_name = _install_as(self.owner, "close-auditor")
+		now = now_datetime()
+		frappe.db.set_value(
+			INSTALLATION,
+			inst_name,
+			{
+				"enabled": 1,
+				"schedule_enabled": 1,
+				"schedule_frequency": "daily",
+				"next_run_at": add_days(now, -1),
+			},
+		)
+		frappe.db.commit()
+		# ROLE_Y is held by NOBODY -> the owner's roles no longer permit the agent.
+		self._restrict("close-auditor", [ROLE_Y])
+
+		# Insulate from any OTHER due installation on this (dev) site: push their
+		# slots out and restore afterwards, so the cron run only touches ours.
+		parked = {
+			r.name: r.next_run_at
+			for r in frappe.get_all(
+				INSTALLATION,
+				filters={
+					"enabled": 1,
+					"schedule_enabled": 1,
+					"next_run_at": ["<=", now],
+					"name": ["!=", inst_name],
+				},
+				fields=["name", "next_run_at"],
+			)
+		}
+		for n in parked:
+			frappe.db.set_value(INSTALLATION, n, "next_run_at", add_days(now, 2), update_modified=False)
+		frappe.db.commit()
+
+		import jarvis.chat.api as chat_api
+
+		calls = []
+		orig_send = chat_api.send_message
+		chat_api.send_message = lambda **kw: calls.append(kw) or {"ok": True}
+		try:
+			agent_scheduler.run_due_agent_audits()
+		finally:
+			chat_api.send_message = orig_send
+			for n, ts in parked.items():
+				frappe.db.set_value(INSTALLATION, n, "next_run_at", ts, update_modified=False)
+			frappe.db.commit()
+
+		# NO turn was dispatched.
+		self.assertEqual(calls, [])
+		# A failed run records WHY, owned by the installation owner.
+		runs = frappe.get_all(
+			RUN,
+			filters={"installation": inst_name, "status": "failed"},
+			fields=["owner", "error"],
+		)
+		self.assertEqual(len(runs), 1)
+		self.assertEqual(runs[0]["owner"], self.owner)
+		self.assertIn("roles no longer permit", runs[0]["error"])
+		# The slot was consumed: next_run_at advanced into the future.
+		inst = frappe.db.get_value(INSTALLATION, inst_name, ["next_run_at", "last_run_at"], as_dict=True)
+		self.assertIsNotNone(inst.last_run_at)
+		self.assertGreater(inst.next_run_at, now)
+
+	# ------------------------------------------------------------------ #
+	# (h) RBAC — sync preserves admin roles; push payload excludes blocked
+	# ------------------------------------------------------------------ #
+	def test_sync_agent_listings_preserves_allowed_roles(self):
+		self._restrict("close-auditor", [ROLE_X])
+		agent_catalog.sync_agent_listings()  # re-sync from the bundled registry
+		roles = frappe.get_all(
+			ALLOWED_ROLE,
+			filters={"parenttype": LISTING, "parent": "close-auditor"},
+			pluck="role",
+		)
+		self.assertEqual(roles, [ROLE_X])
+		# ... while registry-owned fields WERE re-synced (still Published).
+		self.assertEqual(frappe.db.get_value(LISTING, "close-auditor", "status"), "Published")
+
+	def test_sync_seeds_default_allowed_roles_on_insert_only(self):
+		# The Custom App Learning scribe ships its admin-only restriction ON BY
+		# DEFAULT via the manifest ``default_allowed_roles``. sync seeds it on the
+		# INSERT branch ONLY, and a re-sync must NEVER clobber an admin's later edit.
+		slug = "custom-app-learning"
+		_ensure_role("Jarvis Admin")
+		# Force the INSERT branch: drop the listing + any allowed_roles rows.
+		frappe.db.delete(ALLOWED_ROLE, {"parenttype": LISTING, "parent": slug})
+		if frappe.db.exists(LISTING, slug):
+			frappe.delete_doc(LISTING, slug, force=True, ignore_permissions=True)
+		frappe.db.commit()
+
+		agent_catalog.sync_agent_listings()  # INSERT → seed the default restriction
+		seeded = set(
+			frappe.get_all(ALLOWED_ROLE, filters={"parenttype": LISTING, "parent": slug}, pluck="role")
+		)
+		self.assertEqual(seeded, {"System Manager", "Jarvis Admin"})
+
+		# An admin narrows it; a re-sync (UPDATE branch) must leave the edit intact.
+		self._restrict(slug, [ROLE_X])
+		agent_catalog.sync_agent_listings()
+		after = frappe.get_all(ALLOWED_ROLE, filters={"parenttype": LISTING, "parent": slug}, pluck="role")
+		self.assertEqual(after, [ROLE_X])  # NOT re-seeded / clobbered
+
+	def test_push_payload_excludes_install_of_blocked_owner(self):
+		inst_name = _install_as(self.owner, "close-auditor")
+		frappe.db.set_value(INSTALLATION, inst_name, "enabled", 1)
+		frappe.db.commit()
+
+		payload = agent_catalog.build_agent_push_payload(owner=self.owner)
+		self.assertTrue(any(p["slug"] == "agent-close-auditor" for p in payload))
+
+		self._restrict("close-auditor", [ROLE_Y])  # owner does NOT hold ROLE_Y
+		payload = agent_catalog.build_agent_push_payload(owner=self.owner)
+		self.assertEqual(payload, [])
+
+		# Re-widening to a role the owner DOES hold includes it again. Not `[]`:
+		# under deny-by-default an empty pair is a refusal, not "unrestricted", so
+		# clearing would assert the opposite of what this step means.
+		self._restrict("close-auditor", ["Jarvis User"])
+		payload = agent_catalog.build_agent_push_payload(owner=self.owner)
+		self.assertTrue(any(p["slug"] == "agent-close-auditor" for p in payload))
+
+	# ------------------------------------------------------------------ #
+	# (i) P0-B — the payload is keyed by SLUG, installs are per-(owner, agent)
+	#
+	# Two users each enabling the same agent used to emit the slug TWICE; admin
+	# rejects a duplicate slug outright ("invalid: duplicate agent skill slug"),
+	# which killed EVERY agent push from the bench, not just that agent.
+	# ------------------------------------------------------------------ #
+	def _enable_for(self, owner: str, slug: str) -> str:
+		inst = _install_as(owner, slug)
+		frappe.db.set_value(INSTALLATION, inst, "enabled", 1)
+		frappe.db.commit()
+		return inst
+
+	def _count_slug(self, payload: list, slug: str) -> int:
+		return sum(1 for p in payload if p["slug"] == slug)
+
+	def test_push_payload_emits_one_entry_per_slug_across_owners(self):
+		"""P0-B: two owners, same agent, both enabled -> the slug appears ONCE."""
+		self._enable_for(self.owner, "close-auditor")
+		self._enable_for(self.other, "close-auditor")
+
+		payload = agent_catalog.build_agent_push_payload()  # bench-global, as the push is
+		self.assertEqual(self._count_slug(payload, "agent-close-auditor"), 1)
+		# ...and the payload as a whole carries no duplicate slug at all, which is
+		# exactly what admin validates.
+		slugs = [p["slug"] for p in payload]
+		self.assertEqual(len(slugs), len(set(slugs)), f"duplicate slug in payload: {slugs}")
+
+	def test_push_payload_dedupe_is_union_not_last_wins(self):
+		"""A slug ships if ANY enabled install clears the gates — a blocked or
+		non-installable sibling row must not suppress a qualifying one."""
+		self._enable_for(self.owner, "close-auditor")
+		blocked = self._enable_for(self.other, "close-auditor")
+
+		# (a) RBAC: only self.owner holds ROLE_X, so self.other's row is excluded.
+		self._restrict("close-auditor", [ROLE_X])
+		payload = agent_catalog.build_agent_push_payload()
+		self.assertEqual(self._count_slug(payload, "agent-close-auditor"), 1)
+
+		# ...and once BOTH rows qualify again it is still ONE entry, not two.
+		# "Jarvis User" (which both fixtures hold), not `[]`: clearing now CLOSES.
+		self._restrict("close-auditor", ["Jarvis User"])
+		payload = agent_catalog.build_agent_push_payload()
+		self.assertEqual(self._count_slug(payload, "agent-close-auditor"), 1)
+
+		# (b) installability: self.other's row is reconciled non-installable.
+		frappe.db.set_value(
+			INSTALLATION,
+			blocked,
+			{"installable": 0, "not_installable_reason": "app_absent_or_ineligible"},
+			update_modified=False,
+		)
+		frappe.db.commit()
+		payload = agent_catalog.build_agent_push_payload()
+		self.assertEqual(self._count_slug(payload, "agent-close-auditor"), 1)
+
+	def test_push_payload_omits_slug_whose_only_install_is_unpublished(self):
+		self._enable_for(self.owner, "close-auditor")
+		frappe.set_user("Administrator")
+		try:
+			agents_api.set_listing_status("close-auditor", "Coming Soon")
+			payload = agent_catalog.build_agent_push_payload(owner=self.owner)
+			self.assertEqual(self._count_slug(payload, "agent-close-auditor"), 0)
+		finally:
+			agents_api.set_listing_status("close-auditor", "Published")  # restore
+
+	def test_push_payload_order_is_deterministic(self):
+		"""The payload is a full reconcile that admin/fleet diffs, so a rebuild of
+		unchanged data must produce a byte-identical list."""
+		self._enable_for(self.owner, "close-auditor")
+		self._enable_for(self.other, "close-auditor")
+		self._enable_for(self.owner, "ledger-scrutiny-auditor")
+
+		first = agent_catalog.build_agent_push_payload()
+		second = agent_catalog.build_agent_push_payload()
+		self.assertEqual(first, second)
+		slugs = [p["slug"] for p in first]
+		self.assertEqual(slugs, sorted(slugs))
+
+	# ------------------------------------------------------------------ #
+	# R1-F2 — the de-dupe short-circuits BEFORE the per-row queries
+	# ------------------------------------------------------------------ #
+	def test_push_payload_short_circuit_preserves_the_slug_set(self):
+		"""The short-circuit skips WORK, never an OUTCOME.
+
+		Oracle: a per-OWNER build can never short-circuit — (owner, agent) is
+		unique, so each such build sees at most one row per agent — which makes the
+		union of the per-owner builds an independent reference for what the
+		bench-global (short-circuiting) build must ship."""
+		self._enable_for(self.owner, "close-auditor")
+		self._enable_for(self.other, "close-auditor")
+		self._enable_for(self.other, "ledger-scrutiny-auditor")
+		# A blocked sibling that must not suppress the qualifying row (union).
+		blocked = self._enable_for(self.admin, "close-auditor")
+		frappe.db.set_value(
+			INSTALLATION,
+			blocked,
+			{"installable": 0, "not_installable_reason": "app_absent_or_ineligible"},
+			update_modified=False,
+		)
+		frappe.db.commit()
+
+		owners = {r.owner for r in frappe.get_all(INSTALLATION, filters={"enabled": 1}, fields=["owner"])}
+		reference = set()
+		for o in owners:
+			reference |= {p["slug"] for p in agent_catalog.build_agent_push_payload(owner=o)}
+
+		payload = agent_catalog.build_agent_push_payload()
+		# SUBSET, not equality (jarvis#1062): the bench-global build also carries the
+		# allowed-listing leg - every granted Published listing, installed or not -
+		# which a per-owner build deliberately skips, so the oracle cannot see those
+		# slugs. The claim under test is unchanged: the short-circuit must never LOSE
+		# a slug the per-owner builds prove is due.
+		self.assertLessEqual(reference, {p["slug"] for p in payload})
+		# ...and still exactly one entry per slug.
+		slugs = [p["slug"] for p in payload]
+		self.assertEqual(len(slugs), len(set(slugs)), f"duplicate slug in payload: {slugs}")
+		self.assertIn("agent-close-auditor", reference)
+		self.assertIn("agent-ledger-scrutiny-auditor", reference)
+
+	def test_push_payload_reads_the_access_tables_once_not_per_row(self):
+		"""The access gate is answered from TWO batched queries, not per install row.
+
+		It used to call ``_user_allowed_for_agent`` per row, which is itself an N+1
+		over both child tables, and this function runs twice per Apply. The maps are
+		now built once and shared with the allowed-listing leg; the per-row helper
+		must not be reached at all."""
+		self._enable_for(self.owner, "close-auditor")
+		self._enable_for(self.other, "close-auditor")
+		self._enable_for(self.admin, "close-auditor")
+
+		counts = {"roles": 0, "users": 0}
+		orig_roles = agents_api._allowed_roles_map
+		orig_users = agents_api._allowed_users_map
+		orig_gate = agents_api._user_allowed_for_agent
+
+		def _roles():
+			counts["roles"] += 1
+			return orig_roles()
+
+		def _users():
+			counts["users"] += 1
+			return orig_users()
+
+		def _gate(*a, **kw):
+			raise AssertionError("per-row access query in the push payload (N+1 regression)")
+
+		agents_api._allowed_roles_map = _roles
+		agents_api._allowed_users_map = _users
+		agents_api._user_allowed_for_agent = _gate
+		try:
+			payload = agent_catalog.build_agent_push_payload()
+		finally:
+			agents_api._allowed_roles_map = orig_roles
+			agents_api._allowed_users_map = orig_users
+			agents_api._user_allowed_for_agent = orig_gate
+
+		self.assertEqual(counts, {"roles": 1, "users": 1})
+		self.assertEqual(self._count_slug(payload, "agent-close-auditor"), 1)
+
+	# ------------------------------------------------------------------ #
+	# (j) P0-B part 2 — a legacy install (run_as_user NULL) must be DISABLEABLE
+	#
+	# Without this there is no UI escape from a bricked push: set_enabled saves
+	# the doc, validate() demanded a run-as user, and reqd:1 blocked it too.
+	# ------------------------------------------------------------------ #
+	def _make_legacy_enabled(self, owner: str, slug: str) -> str:
+		"""An install as it exists on benches that predate run_as_user: enabled,
+		with a NULL executing identity."""
+		inst = _install_as(owner, slug)
+		frappe.db.set_value(INSTALLATION, inst, {"enabled": 1, "run_as_user": None}, update_modified=False)
+		frappe.db.commit()
+		return inst
+
+	def test_legacy_install_without_run_as_user_can_be_disabled(self):
+		inst = self._make_legacy_enabled(self.owner, "close-auditor")
+		frappe.set_user(self.owner)
+		try:
+			res = agents_api.set_enabled(inst, 0)
+		finally:
+			frappe.set_user("Administrator")
+		self.assertEqual(res["data"]["enabled"], 0)
+		self.assertEqual(frappe.db.get_value(INSTALLATION, inst, "enabled"), 0)
+		# The escape actually clears the push: the slug is gone from the payload.
+		payload = agent_catalog.build_agent_push_payload(owner=self.owner)
+		self.assertEqual(self._count_slug(payload, "agent-close-auditor"), 0)
+
+	def test_enabling_without_run_as_user_still_throws(self):
+		inst = self._make_legacy_enabled(self.owner, "close-auditor")
+		frappe.db.set_value(INSTALLATION, inst, "enabled", 0, update_modified=False)
+		frappe.db.commit()
+		frappe.set_user(self.owner)
+		try:
+			with self.assertRaises(frappe.ValidationError):
+				agents_api.set_enabled(inst, 1)
+		finally:
+			frappe.set_user("Administrator")
+		self.assertEqual(frappe.db.get_value(INSTALLATION, inst, "enabled"), 0)
+
+	def test_run_as_escalation_guard_still_blocks_cross_user_mapping(self):
+		"""A4: a non-admin owner may map the agent only to THEMSELVES — unchanged
+		by the blank-is-ok-while-disabled relaxation."""
+		inst = _install_as(self.owner, "close-auditor")
+		frappe.set_user(self.owner)
+		try:
+			with self.assertRaises(frappe.PermissionError):
+				agents_api.set_run_as_user(inst, self.other)
+		finally:
+			frappe.set_user("Administrator")
+		self.assertEqual(frappe.db.get_value(INSTALLATION, inst, "run_as_user"), self.owner)
+
+	def test_run_as_escalation_guard_holds_on_a_disabled_legacy_row(self):
+		"""The blank short-circuit must not become a staging ground: assigning a
+		run_as_user to a DISABLED row is litigated exactly as on an enabled one,
+		so a later enable cannot wave an unvetted mapping through."""
+		inst = self._make_legacy_enabled(self.owner, "close-auditor")
+		frappe.db.set_value(INSTALLATION, inst, "enabled", 0, update_modified=False)
+		frappe.db.commit()
+		frappe.set_user(self.owner)
+		try:
+			with self.assertRaises(frappe.PermissionError):
+				agents_api.set_run_as_user(inst, self.admin)  # a System Manager
+		finally:
+			frappe.set_user("Administrator")
+		self.assertIsNone(frappe.db.get_value(INSTALLATION, inst, "run_as_user") or None)
+
+	# ------------------------------------------------------------------ #
+	# (k) R1-F3 — a blank run_as_user is REFUSED at every DISPATCH entry point
+	#
+	# ``reqd`` on run_as_user had to go (a disabled legacy row must stay
+	# DISABLEABLE) and the controller check that replaced it lives in validate(),
+	# which frappe skips WHOLESALE under ``flags.ignore_validate``
+	# (run_before_save_methods returns early; ``_validate`` — the reqd enforcer —
+	# is the one that always runs). An ENABLED install with no executing identity
+	# is therefore persistable by a future seeder/importer, and the old
+	# ``run_as_user or owner`` fallback would have silently bound its ERP reads to
+	# the row OWNER — an identity ``_validate_run_as_escalation`` never litigated.
+	# Every dispatch path must refuse instead, diagnosably.
+	# ------------------------------------------------------------------ #
+	def _no_dispatch(self, **kw):
+		raise AssertionError("an install with no run-as user must never reach dispatch")
+
+	def test_launch_audit_refuses_blank_run_as_user(self):
+		"""The shared choke point BOTH dispatch paths funnel through."""
+		import jarvis.admin_client as admin_client
+
+		inst_name = self._make_legacy_enabled(self.owner, "close-auditor")
+		inst = frappe.get_doc(INSTALLATION, inst_name)
+		convs_before = frappe.db.count("Jarvis Conversation")
+
+		orig_run = admin_client.post_agent_run
+		admin_client.post_agent_run = self._no_dispatch
+		try:
+			frappe.set_user(self.owner)
+			with self.assertRaises(frappe.ValidationError) as ctx:
+				agent_scheduler._launch_audit(inst, trigger="manual")
+		finally:
+			frappe.set_user("Administrator")
+			admin_client.post_agent_run = orig_run
+
+		self.assertIn("run-as user", str(ctx.exception))
+		# Refused BEFORE anything is written — no orphan conversation, no orphan Run.
+		self.assertEqual(frappe.db.count("Jarvis Conversation"), convs_before)
+		self.assertEqual(frappe.get_all(RUN, filters={"installation": inst_name}, pluck="name"), [])
+
+	def test_run_agent_now_refuses_blank_run_as_user(self):
+		"""Manual entry point — refused, never silently run as the row owner."""
+		import jarvis.admin_client as admin_client
+
+		inst_name = self._make_legacy_enabled(self.owner, "close-auditor")
+		orig_run = admin_client.post_agent_run
+		admin_client.post_agent_run = self._no_dispatch
+		try:
+			frappe.set_user(self.owner)
+			with self.assertRaises(frappe.ValidationError) as ctx:
+				agents_api.run_agent_now(inst_name)
+		finally:
+			frappe.set_user("Administrator")
+			admin_client.post_agent_run = orig_run
+
+		self.assertIn("run-as user", str(ctx.exception))
+		self.assertEqual(frappe.get_all(RUN, filters={"installation": inst_name}, pluck="name"), [])
+
+	def test_scheduler_refuses_blank_run_as_user_and_consumes_the_slot(self):
+		"""Scheduled entry point — skipped with a RECORDED reason (an operator has
+		to be able to diagnose it), and the slot is consumed so a misconfiguration
+		does not busy-retry every hour for ever."""
+		from frappe.utils import add_days, now_datetime
+
+		import jarvis.admin_client as admin_client
+
+		inst_name = self._make_legacy_enabled(self.owner, "close-auditor")
+		now = now_datetime()
+		frappe.db.set_value(
+			INSTALLATION,
+			inst_name,
+			{"schedule_enabled": 1, "schedule_frequency": "daily", "next_run_at": add_days(now, -1)},
+			update_modified=False,
+		)
+		frappe.db.commit()
+
+		# Insulate from any OTHER due installation on this (dev) site: park their
+		# slots and restore afterwards, so the cron run only touches ours.
+		parked = {
+			r.name: r.next_run_at
+			for r in frappe.get_all(
+				INSTALLATION,
+				filters={
+					"enabled": 1,
+					"schedule_enabled": 1,
+					"next_run_at": ["<=", now],
+					"name": ["!=", inst_name],
+				},
+				fields=["name", "next_run_at"],
+			)
+		}
+		for n in parked:
+			frappe.db.set_value(INSTALLATION, n, "next_run_at", add_days(now, 2), update_modified=False)
+		frappe.db.commit()
+
+		orig_run = admin_client.post_agent_run
+		admin_client.post_agent_run = self._no_dispatch
+		try:
+			agent_scheduler.run_due_agent_audits()
+		finally:
+			admin_client.post_agent_run = orig_run
+			for n, ts in parked.items():
+				frappe.db.set_value(INSTALLATION, n, "next_run_at", ts, update_modified=False)
+			frappe.db.commit()
+
+		runs = frappe.get_all(RUN, filters={"installation": inst_name}, fields=["owner", "status", "error"])
+		self.assertEqual(len(runs), 1)
+		self.assertEqual(runs[0]["status"], "failed")  # never "running"
+		self.assertEqual(runs[0]["owner"], self.owner)  # the customer sees WHY
+		self.assertIn("no run-as user", runs[0]["error"])
+		# The slot was consumed: next_run_at advanced into the future.
+		row = frappe.db.get_value(INSTALLATION, inst_name, ["next_run_at", "last_run_at"], as_dict=True)
+		self.assertIsNotNone(row.last_run_at)
+		self.assertGreater(row.next_run_at, now)
+
+	def test_dispatch_paths_are_unchanged_for_a_valid_run_as_user(self):
+		"""The refusal must not perturb the normal case: an install carrying a
+		valid run-as user still dispatches, under THAT identity."""
+		import jarvis.admin_client as admin_client
+
+		inst_name = self._enable_for(self.owner, "close-auditor")
+		captured = {}
+		orig_run = admin_client.post_agent_run
+
+		def _cap(**kw):
+			captured["user"] = frappe.session.user
+			return {"run_id": kw.get("run_id"), "status": "queued"}
+
+		admin_client.post_agent_run = _cap
+		try:
+			frappe.set_user(self.owner)
+			res = agents_api.run_agent_now(inst_name)
+		finally:
+			frappe.set_user("Administrator")
+			admin_client.post_agent_run = orig_run
+
+		self.assertTrue(res["ok"])
+		self.assertEqual(captured.get("user"), self.owner)
+		self.assertEqual(frappe.db.get_value(RUN, res["data"]["run"], "status"), "running")
+
+	# ------------------------------------------------------------------ #
+	# (l) CX1-1 — a blank-identity install must not reach the CONTAINER either
+	#
+	# The gap left between the schema relaxation and global push eligibility:
+	# R1-F3 makes every RUN path refuse an enabled install with no run-as user,
+	# but the push payload never looked at the field, so the slug still shipped —
+	# provisioning the delegate, seating it in the container roster and the
+	# tenant's agent_roster, and advertising an agent the bench can never run.
+	# ------------------------------------------------------------------ #
+	def test_push_payload_omits_slug_whose_only_install_has_no_run_as_user(self):
+		"""An enabled-but-blank install is the ONLY install of the slug -> the slug
+		is absent from the payload entirely."""
+		inst = self._make_legacy_enabled(self.owner, "close-auditor")
+		payload = agent_catalog.build_agent_push_payload(owner=self.owner)
+		self.assertEqual(self._count_slug(payload, "agent-close-auditor"), 0)
+
+		# ...and it is the BLANK IDENTITY that excluded it, not some unrelated gate:
+		# give the very same row a run-as user and the same build ships the slug.
+		frappe.db.set_value(INSTALLATION, inst, "run_as_user", self.owner, update_modified=False)
+		frappe.db.commit()
+		payload = agent_catalog.build_agent_push_payload(owner=self.owner)
+		self.assertEqual(self._count_slug(payload, "agent-close-auditor"), 1)
+
+	def test_push_payload_union_survives_a_blank_run_as_user_sibling(self):
+		"""UNION semantics: owner A valid + owner B blank, SAME slug -> the slug
+		still ships, exactly ONCE. The blank row must disqualify only itself."""
+		a = self._enable_for(self.owner, "close-auditor")
+		b = self._enable_for(self.other, "close-auditor")
+		# Installs are hash-named and the build iterates ``agent asc, name asc``, so
+		# blank whichever row sorts FIRST: that is the ordering in which a gate that
+		# wrongly suppressed the agent would actually bite (the blank row reached
+		# BEFORE the valid one).
+		frappe.db.set_value(INSTALLATION, min(a, b), "run_as_user", None, update_modified=False)
+		frappe.db.commit()
+
+		payload = agent_catalog.build_agent_push_payload()
+		self.assertEqual(self._count_slug(payload, "agent-close-auditor"), 1)
+		slugs = [p["slug"] for p in payload]
+		self.assertEqual(len(slugs), len(set(slugs)), f"duplicate slug in payload: {slugs}")
+
+		# The surviving entry is the normal, complete enablement signal.
+		entry = next(p for p in payload if p["slug"] == "agent-close-auditor")
+		self.assertEqual(entry["delivery"], "delegate")
+
+		# Blanking the OTHER row too (no valid install left) drops the slug — proof
+		# the entry above came from the qualifying sibling, not from a leaky gate.
+		# Asserted on the per-OWNER builds: those skip the allowed-listing leg, which
+		# would otherwise ship this (granted, Published) slug on its own and say
+		# nothing about the install gate this test is actually about.
+		frappe.db.set_value(INSTALLATION, max(a, b), "run_as_user", None, update_modified=False)
+		frappe.db.commit()
+		for o in (self.owner, self.other):
+			payload = agent_catalog.build_agent_push_payload(owner=o)
+			self.assertEqual(self._count_slug(payload, "agent-close-auditor"), 0)
+
+	# ------------------------------------------------------------------ #
+	# jarvis#1062 - list_agent_activity_page's live run_status join: the
+	# action verb ("Run started") is a point-in-time label; run_status is
+	# the run's CURRENT status, joined in one batched query for the page.
+	# ------------------------------------------------------------------ #
+	def _mk_run(self, owner: str, slug: str, inst: str, *, status: str) -> str:
+		doc = frappe.get_doc(
+			{
+				"doctype": RUN,
+				"agent": slug,
+				"installation": inst,
+				"trigger": "manual",
+				"status": status,
+			}
+		)
+		doc.flags.ignore_permissions = True
+		doc.insert(ignore_permissions=True)
+		frappe.db.set_value(RUN, doc.name, "owner", owner, update_modified=False)
+		frappe.db.commit()
+		return doc.name
+
+	def _mk_activity(self, owner: str, slug: str, inst: str, *, action: str, run: str | None = None) -> str:
+		doc = frappe.get_doc(
+			{
+				"doctype": ACTIVITY,
+				"agent": slug,
+				"agent_title": slug,
+				"installation": inst,
+				"action": action,
+				"run": run or "",
+			}
+		)
+		doc.flags.ignore_permissions = True
+		doc.insert(ignore_permissions=True)
+		frappe.db.set_value(ACTIVITY, doc.name, "owner", owner, update_modified=False)
+		frappe.db.commit()
+		return doc.name
+
+	def test_activity_page_joins_current_run_status(self):
+		inst = self._enable_for(self.owner, "close-auditor")
+		run_still_running = self._mk_run(self.owner, "close-auditor", inst, status="running")
+		run_now_failed = self._mk_run(self.owner, "close-auditor", inst, status="failed")
+
+		act_running = self._mk_activity(
+			self.owner, "close-auditor", inst, action="run_started", run=run_still_running
+		)
+		# The action verb here still reads "Run started" - written at dispatch
+		# time - but the run has SINCE failed. run_status must reflect that,
+		# not the stale action label.
+		act_stale_label = self._mk_activity(
+			self.owner, "close-auditor", inst, action="run_started", run=run_now_failed
+		)
+		act_no_run = self._mk_activity(self.owner, "close-auditor", inst, action="enabled")
+
+		frappe.set_user(self.owner)
+		try:
+			page = agents_api.list_agent_activity_page(agent="close-auditor")
+		finally:
+			frappe.set_user("Administrator")
+
+		by_name = {r["name"]: r for r in page["rows"]}
+		self.assertEqual(by_name[act_running]["run_status"], "running")
+		self.assertEqual(by_name[act_stale_label]["run_status"], "failed")
+		self.assertIsNone(by_name[act_no_run]["run_status"])
+
+	def test_activity_page_run_status_null_when_run_deleted(self):
+		inst = self._enable_for(self.owner, "close-auditor")
+		run = self._mk_run(self.owner, "close-auditor", inst, status="completed")
+		act = self._mk_activity(self.owner, "close-auditor", inst, action="run_completed", run=run)
+
+		frappe.delete_doc(RUN, run, force=True, ignore_permissions=True)
+		frappe.db.commit()
+
+		frappe.set_user(self.owner)
+		try:
+			page = agents_api.list_agent_activity_page(agent="close-auditor")
+		finally:
+			frappe.set_user("Administrator")
+
+		row = next(r for r in page["rows"] if r["name"] == act)
+		self.assertIsNone(row["run_status"])

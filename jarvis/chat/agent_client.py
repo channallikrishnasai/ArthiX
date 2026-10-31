@@ -1,0 +1,1902 @@
+"""Agent gateway client - direct WebSocket with device-paired auth.
+
+WIRE-CONTRACT BOUNDARY - preserve the runtime's exact protocol identifiers,
+device-auth envelope, image coordinates, configuration filenames and route
+markers. Renaming those would break the plugin, fleet executor or container.
+Use "agent" or "gateway" in explanatory prose. The runtime-branding test
+enforces this distinction, including in this module.
+
+Previously this module shelled out to `docker compose exec ... node -e <script>`
+so the WS connection would appear as loopback inside the container - agent
+strips self-declared `operator.write` scopes from non-loopback token-only
+clients, and the chat worker needed write scope for sessions.create.
+
+The gateway supports pairing the customer bench as
+a device once (via jarvis.chat.device.ensure_paired → admin → fleet-agent),
+and present an Ed25519-signed v3 device-auth envelope at every connect.
+The gateway verifies the signature against the registered public key, grants
+the requested scopes, and the rest of the protocol (sessions.create, agent,
+event streaming) is identical to what the Node script used to do - only the
+transport changed from subprocess-pipes to direct WS frames.
+
+Public surface: AgentSession.connect / create_session / chat_send /
+relay_turn_events / set_session_model / subscribe_session / get_history /
+get_session_messages / is_run_active / fire_agent / stream_agent_turn /
+close. The managed chat path now uses the relay pair (chat_send +
+relay_turn_events): the turn is owned by agent after the chat.send ack,
+streaming rides the broadcast agent frames, completion comes from the
+run-scoped chat event, and relay_turn_events never raises after entry -
+interruptions degrade to snapshot recovery instead of errors.
+stream_agent_turn remains for auto-title; fire_agent for prewarm.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import threading
+import time
+import uuid
+from collections.abc import Callable, Iterator
+from typing import Any
+
+import websocket
+
+_logger = logging.getLogger(__name__)
+
+from jarvis.chat import egress_rules, site_pin
+from jarvis.chat.device import (
+	ChatDeviceCredentials,
+	build_payload_v3,
+	clear_credentials,
+	ensure_paired,
+	sign_payload,
+	update_device_token,
+)
+from jarvis.chat.events import parse_event
+
+# #773: every socket call of a session goes through one gated, deadline-bounded IO
+# path; the names are re-exported here for callers of this module.
+from jarvis.chat.socket_io import (
+	IO_GATE_WAIT_S,
+	IO_WRITE_TIMEOUT_S,
+	SendNotStarted,
+	SendUncertain,
+	_SocketIO,
+)
+
+# Agent gateway's WS frame format. Looks JSON-RPC-shaped but has its
+# own type discriminator (``"type": "req"|"res"|"event"``) rather than
+# JSON-RPC 2.0's ``"jsonrpc": "2.0"`` field, so a generic JSON-RPC
+# library doesn't fit. The frame builders here are the (small,
+# explicit) protocol seam between the bench and agent's WS;
+# centralised so the next time we need to add a frame field (e.g.
+# trace IDs, span context) it lands in one place rather than at every
+# ws.send site. Punch-list item "JSON-RPC framing reinvented" from
+# the 2026-06-16 review.
+
+
+def _build_request_frame(method: str, params: dict, *, req_id: str | None = None) -> tuple[str, str]:
+	"""Build a serialised agent request frame.
+
+	Returns (json_payload, req_id) - caller passes json_payload to
+	ws.send and uses req_id to match the response frame.
+	"""
+	rid = req_id or uuid.uuid4().hex
+	return json.dumps(
+		{
+			"type": "req",
+			"id": rid,
+			"method": method,
+			"params": params,
+		}
+	), rid
+
+
+def _is_response_frame(frame: dict, req_id: str) -> bool:
+	"""True when ``frame`` is the response to the request that issued
+	``req_id``. Encapsulates the (type, id) discrimination so the two
+	caller sites don't open-code it independently."""
+	return frame.get("type") == "res" and frame.get("id") == req_id
+
+
+from jarvis.exceptions import AgentUnreachableError
+
+CONNECT_TIMEOUT_SECONDS = 10
+
+# A dormant / just-recreated container's gateway is unreachable for ~10-30s
+# while `compose up -d` recreates it (see jarvis/api.py rotate_agent_token) or
+# while a rotated-dormant container spins back up. A single 10s connect with no
+# retry guarantees a first-turn failure ("WS open failed: Connection timed out")
+# against a cold container, so we retry the WS OPEN - network-level failures
+# only, NOT handshake/auth - until a total deadline, sleeping briefly between
+# attempts. A warm container connects on the first attempt (no added latency);
+# only a genuinely cold/dormant one pays the retry window.
+CONNECT_OPEN_DEADLINE_SECONDS = 25
+CONNECT_OPEN_RETRY_BACKOFF_SECONDS = 2.0
+
+# agent v2026.6.8 (issue #29385) enforces gateway.controlUi.allowedOrigins on
+# LAN binds since v2026.2.26 and no longer honors a "*" wildcard: a
+# `--bind lan` gateway seeds ["http://localhost:18789", "http://127.0.0.1:18789"]
+# (its own internal port, a fixed constant) as the ONLY allowed origins. Our
+# server-side WS client isn't a browser, so it just has to present an Origin
+# agent accepts — send one of the seeded values, NOT a bare "http://localhost"
+# (which the old "*" config used to wave through and now gets rejected).
+_GATEWAY_ORIGIN = "http://127.0.0.1:18789"
+# The primary (default) agent id the fleet-agent template keys the main roster
+# entry as; named on sessions.create when a 2026.9+ multi-agent roster requires
+# explicit agent selection (see create_session).
+_PRIMARY_AGENT_ID = "main"
+# Wall-clock cap on one agent turn waiting for the WS lifecycle to
+# complete (final lifecycle "end" frame from agent). Was 180s when
+# the bench + agent container ran on the same host (sub-ms WS
+# RTT); bumped to 600s after a Frappe-Cloud-hosted bench + Hetzner-
+# hosted agent deploy hit the 180s cap on multi-recipient
+# announcement turns. Each tool call now crosses the public internet
+# (~50-200ms WAN RTT depending on FC↔Hetzner region pairing); a
+# typical multi-step turn with ~30 tool calls + a 26-recipient batch
+# send hit ~4-8s of pure network overhead alone, then ran past the
+# 180s ceiling before agent emitted lifecycle-end. The row-guard
+# walk-back (jarvis#134) cut the tool-call count meaningfully but
+# WAN latency is a structural floor; the timeout has to absorb it.
+# The matching RQ envelope ``_AGENT_TURN_WORKER_TIMEOUT`` in
+# jarvis/chat/api.py was bumped in lockstep so the worker has room
+# for this turn + pair + WS connect overhead.
+TURN_TIMEOUT_SECONDS = 600
+
+# The runtime's image/video/music generation tools unconditionally detach into a
+# background task on every normal chat session (no config switch): the
+# in-flight run is aborted with an EMPTY terminal (sessions_yield/turnHandoff),
+# then ~25-30s later a NEW run on the SAME sessionKey (a fresh runId) posts the
+# real reply. This bounds how long a turn waits for that follow-up before
+# falling back to today's error path. Comfortably inside TURN_TIMEOUT_SECONDS.
+YIELD_CONTINUATION_WAIT_S = 150
+
+# Polling granularity while waiting for the yield's continuation: short enough
+# that a user Stop pressed mid-wait (which cannot otherwise interrupt a single
+# long _recv call - the dead original runId will never post another frame) is
+# observed promptly.
+YIELD_CONTINUATION_POLL_S = 3.0
+
+# --- pinned one-shots (issue #531) ------------------------------------------
+#
+# ``fire_agent`` / ``stream_agent_turn`` are the only two RPCs here that carry
+# an explicit model/provider, and passing either one COSTS the run its whole
+# failover chain. Verified against the shipped bundle of
+# gateway image version 2026.6.8:
+#
+#   agent-command: hasExplicitRunOverride = Boolean(opts.provider || opts.model)
+#                  resolveEffectiveModelFallbacks({
+#                      hasSessionModelOverride: hasExplicitRunOverride || ...,
+#                      modelOverrideSource: hasExplicitRunOverride ? "user" : ...,
+#                  })
+#   agent-scope:   if (!(modelOverrideSource === "auto" || ...)) return [];
+#
+# So an explicit per-request model hardcodes source "user" and the effective
+# fallback list collapses to []. There is no way to opt back in: AgentParamsSchema
+# is ``additionalProperties: false`` over {message, agentId, provider, model, ...}
+# with no modelOverrideSource / allowFallbacks knob, and sessions.patch rejects
+# the marker outright (closed PR #517).
+#
+# The pin is deliberate and must NOT be "fixed" by dropping it: prewarm exists
+# to warm ONE model's prefix cache (a failover would warm the wrong one), and
+# auto-title deliberately bills against a cheap model rather than the pool
+# primary. What was wrong was that the resulting agent log
+# (``decision=surface_error ... next=none``) read exactly like a dead chain.
+#
+# Both halves of the fix live here, at the boundary that actually puts model on
+# the wire, so they cannot drift from the RPC params:
+#
+#  1. a pinned run id is prefixed differently from an unpinned one, which makes
+#     agent's own ``embedded run failover decision: runId=... next=none``
+#     line self-describing without cross-referencing anything;
+#  2. the bench logs one line per pinned turn naming the run id and the pinned
+#     model, so the jarvis-side log answers the question on its own too.
+#
+# agent uses the idempotency key verbatim as the run id
+# (``const idem = request.idempotencyKey; const runId = idem;``), so the prefix
+# survives to every failover log line. Both must stay clear of agent's own
+# ``exec-approval-followup:`` key namespace, and stay well under the 200-char
+# console truncation.
+#
+# The two prefixes have to track the RPC params exactly. A one-shot whose model
+# resolved empty is NOT pinned - it keeps its fallbacks - so a ``next=none``
+# under ONESHOT_RUN_PREFIX really does mean the chain is dead, and claiming
+# otherwise would recreate the very ambiguity this exists to remove.
+PINNED_ONESHOT_RUN_PREFIX = "jarvis-pinned-"
+ONESHOT_RUN_PREFIX = "jarvis-oneshot-"
+
+
+def oneshot_run_id(kind: str, unique: str, *, model: str | None, provider: str | None) -> str:
+	"""Idempotency key (== agent run id) for a throwaway one-shot turn.
+
+	``kind`` names the feature (title / polish / prewarm); ``unique`` is
+	whatever already made the caller's key unique, kept so the run id still
+	points back at its session. agent dedupes on this key, so ``unique``
+	must stay per-call. Pass the same model/provider the turn will send: they
+	decide which prefix the run id gets."""
+	prefix = PINNED_ONESHOT_RUN_PREFIX if (model or provider) else ONESHOT_RUN_PREFIX
+	return f"{prefix}{kind}:{unique}"
+
+
+def _log_pinned_oneshot(run_id: str, model: str | None, provider: str | None) -> None:
+	"""Record that this turn traded failover away for a pinned model.
+
+	Keyed on the run id so it joins straight onto agent's
+	``embedded run failover decision: runId=...`` line. Without this a
+	``next=none`` from a pinned one-shot is indistinguishable from an
+	exhausted chain (issue #531)."""
+	_logger.info(
+		"pinned one-shot turn: runId=%s model=%s provider=%s fallbacks=none-by-design "
+		"reason=explicit-model-on-agent-rpc",
+		run_id,
+		model or "-",
+		provider or "-",
+	)
+
+
+# Scopes the chat path needs: operator.write for sessions.create + agent;
+# operator.admin so the same connection can also read state (status snapshots,
+# etc.) without re-pairing.
+_REQUESTED_SCOPES = ["operator.write", "operator.admin"]
+_CLIENT_ID = "gateway-client"
+_CLIENT_MODE = "backend"
+_ROLE = "operator"
+_PLATFORM = "linux"  # informational; only affects the v3 signature payload
+
+# agent rejection codes that indicate the customer's stored pairing
+# is stale for the CURRENT container (typically because admin re-provisioned
+# the tenant and the new container has no record of this deviceId). On
+# any of these we wipe + re-pair once. OTHER rejection codes
+# (signature-invalid, scope-mismatch, etc.) are programming bugs / config
+# errors and must NOT trigger a retry - that'd hide the bug behind silent
+# re-pair attempts that destroy valid credentials.
+#
+# Sprint-3 (2026-06-16 review): we used to substring-match on
+# ``str(err).lower()`` which would false-positive any future error
+# embedding one of these tokens in its message text (think log lines,
+# diagnostic dumps, partial-match codes like ``device-not-paired-yet``).
+# The classifier now reads the structured ``.code`` attribute populated
+# at the raise site from agent's response envelope.
+_STALE_PAIRING_CODES = frozenset(
+	{
+		"device-not-paired",
+		"token-mismatch",
+		"token-revoked",
+		"device-id-mismatch",
+	}
+)
+
+# agent's ACTUAL wire shape for device-token auth failures (verified
+# 2026-07-09 against the gateway image from 2026-06-16
+# AND current :latest, plus a live reproduction against a running
+# gateway): connect is rejected with the GENERIC ``error.code``
+# "INVALID_REQUEST" and the machine-readable reason lives in
+# ``error.details.authReason``. The gateway maps EVERY explicit-
+# deviceToken auth failure - device not paired (container replaced /
+# state reset), token mismatch (gateway rotated the stored token),
+# token revoked - to the single coarse reason "device_token_mismatch"
+# ("unauthorized: device token mismatch (rotate/reissue device token)").
+# The hyphenated reasons in _STALE_PAIRING_CODES are agent's INTERNAL
+# verifyDeviceToken results; they never reach the wire as error.code, so
+# the code-only classifier alone never fired and the self-heal below was
+# dead code - a replaced tenant container permanently broke chat
+# (2026-07-08 post-deploy regression). _STALE_PAIRING_CODES is kept as a
+# belt-and-braces layer in case a future agent promotes the internal
+# reasons to wire codes.
+_STALE_PAIRING_AUTH_REASONS = frozenset(
+	{
+		"device_token_mismatch",
+	}
+)
+
+# The same rejection also carries a second, more specific machine-readable
+# value at ``error.details.code`` (distinct from the outer, generic
+# ``error.code``): "AUTH_DEVICE_TOKEN_MISMATCH" alongside
+# ``recommendedNextStep: "update_auth_credentials"``. authReason above is
+# the primary signal (every captured live rejection carries it); this is
+# belt-and-braces for a future gateway build that drops authReason but
+# keeps details.code.
+_STALE_PAIRING_DETAIL_CODES = frozenset(
+	{
+		"AUTH_DEVICE_TOKEN_MISMATCH",
+	}
+)
+
+
+def _is_stale_pairing(err: Exception) -> bool:
+	"""Return True iff ``err`` is an AgentUnreachableError that agent
+	classified as a stale device pairing - via error.code (internal reason
+	set), error.details.authReason, or error.details.code (the real wire
+	shape for connect auth failures, see _STALE_PAIRING_AUTH_REASONS /
+	_STALE_PAIRING_DETAIL_CODES above).
+
+	Strictly typed: an error WITHOUT a ``.code``/``.details`` attribute
+	(network-level failure, programmer bug) never triggers the repair
+	path, and neither does a marker string embedded in the message text.
+	"""
+	code = getattr(err, "code", None)
+	if code in _STALE_PAIRING_CODES:
+		return True
+	details = getattr(err, "details", None)
+	if not isinstance(details, dict):
+		return False
+	if details.get("authReason") in _STALE_PAIRING_AUTH_REASONS:
+		return True
+	return details.get("code") in _STALE_PAIRING_DETAIL_CODES
+
+
+# --- Mechanism A: connect-first device pairing ------------------------------
+#
+# On a Mechanism-A tenant (agent 9.x) the bench has a STABLE keypair but no
+# device token yet. It presents the shared gateway token (auth.token) on a
+# signed connect; agent answers NOT_PAIRED and opens a DURABLE pending pairing
+# request, then closes the socket (WS 1008) with a pauseReconnect hint. The CP
+# has told the fleet-agent to poll + approve this deviceId; on the approved
+# reconnect agent issues the device token on hello-ok.auth.deviceToken. We
+# drive that by reconnecting on OUR OWN timer, ignoring the pause hint.
+#
+# Bounded (D-e): ONE pairing episode per turn-that-needs-pairing, capped WELL
+# inside agent's ~5-min pending TTL and the chat-turn budget; fail-closed at
+# the cap (D-d). The deadline sits a little above the fleet-agent's
+# tens-of-seconds poll+approve window so an approval lands within one turn.
+PAIRING_APPROVAL_DEADLINE_SECONDS = 75
+PAIRING_RECONNECT_BACKOFF_SECONDS = 3.0
+
+# User-facing copy for a pairing that has not been approved yet when we hit the
+# cap (fail-closed). Honest, not a fake success or a dead card: normal chat
+# resumes on the next turn once the fleet-agent's approval lands. Kept generic so
+# _classify_error still files it under "unreachable" (assistant starting up).
+PAIRING_PENDING_USER_MESSAGE = "Still getting your assistant ready. Try again in a moment."
+
+# agent's wire signal for "presented the gateway token, no paired device yet"
+# (spike-proven on the real 9.3 dist, invariant #3): error.code NOT_PAIRED, and
+# on the generic INVALID_REQUEST envelope the machine-readable marker sits in
+# error.details.code = PAIRING_REQUIRED / error.details.{authReason,reason} =
+# not-paired. This set is DISJOINT from the stale-pairing markers above
+# (device_token_mismatch / AUTH_DEVICE_TOKEN_MISMATCH), and the two paths are
+# further separated by connect MODE - a bootstrap connect presents auth.token
+# (no deviceToken to mismatch), a steady-state connect presents auth.deviceToken
+# - so a NOT_PAIRED response can never route into the keypair-wiping
+# stale-pairing repair path (plan-check gap #3).
+_NOT_PAIRED_CODES = frozenset({"NOT_PAIRED"})
+_NOT_PAIRED_DETAIL_CODES = frozenset({"PAIRING_REQUIRED", "NOT_PAIRED"})
+_NOT_PAIRED_REASONS = frozenset({"not-paired"})
+
+
+def _is_not_paired(err: Exception) -> bool:
+	"""Return True iff ``err`` is agent's connect-first PENDING signal: the
+	bench presented the gateway token (bootstrap) and agent created/returned a
+	pending pairing request instead of authenticating.
+
+	Strictly typed, exactly like ``_is_stale_pairing``: only ``.code``/``.details``
+	are consulted, never message text. This is the ONLY classifier the bootstrap
+	loop reads, so a NOT_PAIRED response is structurally kept OUT of the
+	keypair-wiping stale-pairing self-heal."""
+	code = getattr(err, "code", None)
+	if code in _NOT_PAIRED_CODES:
+		return True
+	details = getattr(err, "details", None)
+	if not isinstance(details, dict):
+		return False
+	if details.get("code") in _NOT_PAIRED_DETAIL_CODES:
+		return True
+	if details.get("authReason") in _NOT_PAIRED_REASONS:
+		return True
+	return details.get("reason") in _NOT_PAIRED_REASONS
+
+
+def _chat_final_text(payload: dict) -> str | None:
+	"""Authoritative final text from a chat final event: joined text blocks
+	of payload.message.content; None for silent finals."""
+	msg = payload.get("message")
+	if not isinstance(msg, dict):
+		return None
+	# PURE extractor: returns the RAW final text so failed-final classification
+	# (_chat_final_failed's exact-string sentinel check) sees un-redacted content.
+	# Redaction + the once-per-turn tripwire happen at the call sites, on the value
+	# actually surfaced, AFTER the failed-final branch is ruled out.
+	c = msg.get("content")
+	if isinstance(c, str):
+		return c or None
+	if isinstance(c, list):
+		parts = [
+			b.get("text", "")
+			for b in c
+			if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
+		]
+		joined = "\n".join(p for p in parts if p.strip())
+		return joined or None
+	return None
+
+
+# agent marks an assistant turn that FAILED before producing any content
+# with ``stopReason == "error"`` and (in the raw transcript) this sentinel text
+# block. A terminal model failure - notably a precheck "Context overflow:
+# prompt too large for the model", which then deletes the session so there is
+# no auto-compact retry - is broadcast as a ``chat`` event with
+# ``state == "final"`` (NOT ``state == "error"``) whose projected display
+# message keeps ``stopReason == "error"`` but has empty (sentinel-stripped)
+# content. Without the guard below, ``relay_turn_events`` would map that to a
+# plain ``relay:final`` and the turn handler would write a silent, empty,
+# error-less assistant bubble (observed live 2026-07-21). Detecting it here, at
+# the gateway-to-bench event boundary, lets the EXISTING relay:error path stamp
+# the row's ``error`` field so the user sees an honest failure.
+_STREAM_ERROR_SENTINEL = "[assistant turn failed before producing content]"
+
+# The agent runtime's media-generation tools: calling one unconditionally
+# detaches the reply into a background task, and when that yielded run then
+# settles with no visible output the gateway's bare terminal (no message, no
+# stopReason - see YIELD_CONTINUATION_WAIT_S) is WIRE-IDENTICAL to a genuine
+# failed_final. The only signal that tells them apart is whether one of these
+# tools started during this same run - tracked where tool events are already
+# routed (relay_turn_events here; the mux lane in relay_mux.py for the pump).
+MEDIA_GEN_TOOL_NAMES = frozenset({"image_generate", "video_generate", "music_generate"})
+
+# User-facing text stamped on the assistant row's ``error`` field (and shown in
+# the chat) for such a failed final when agent gave us nothing better.
+# Generic on purpose: a ``state == "final"`` event carries no ``errorMessage``
+# (only ``stopReason``), so the exact cause cannot be named from that frame
+# alone; a context window too small for the conversation is the common one.
+# ``failed_final_error`` below names the cause instead whenever the run's
+# lifecycle error frame supplied one. Must NOT contain "context overflow" (that
+# substring reroutes the turn handler into the auto-compact park-for-recovery
+# branch, which never lands for a terminal precheck failure) or "aborted".
+FAILED_FINAL_ERROR = (
+	"The assistant could not complete this response and the turn ended "
+	"without any output. This can happen when the conversation is too long "
+	"for the current model, or the model hit an error. Please try again, or "
+	"start a new chat."
+)
+
+# Substrings a provider detail must not carry into a failed final's error text:
+# ``turn_handler`` routes a relay:error containing "context overflow" into the
+# auto-compact park-for-recovery branch (turn_handler.py) and reads "aborted" as
+# a clean user stop. Neither is true of a TERMINAL failed final, and letting
+# provider prose steer that control flow would put the turn straight back to
+# spinning. A detail carrying either marker is dropped for the generic copy.
+_ERROR_DETAIL_REROUTE_MARKERS = ("context overflow", "aborted")
+
+# Cap on the appended provider detail. agent's own failure text is already
+# user-facing and self-truncating (~200 chars); this only stops a pathological
+# runtime from filling the Message.error column (settlement stores error[:1000]).
+_ERROR_DETAIL_MAX_CHARS = 400
+
+
+def failed_final_error(detail: str | None = None) -> str:
+	"""User-facing error text for a failed final, naming the provider reason
+	when agent gave one.
+
+	The run's lifecycle ``phase == "error"`` frame is the ONLY place the runtime
+	names the failure ("Google Generative AI API error (429): You exceeded your
+	current quota..."), and that is the actionable half of the message - the
+	customer can top up a quota, they cannot act on "something went wrong". The
+	relay drops lifecycle frames from the terminal path (the chat event stays
+	the single terminal) but remembers this text; pass it here. Without a
+	detail, FAILED_FINAL_ERROR is all we can honestly say."""
+	d = (detail or "").strip()
+	if not d or any(marker in d.lower() for marker in _ERROR_DETAIL_REROUTE_MARKERS):
+		return FAILED_FINAL_ERROR
+	# The provider detail is runtime-authored prose - scrub the brand family before
+	# it reaches the customer (silent; error banners don't tripwire).
+	return egress_rules.redact(
+		f"The assistant could not complete this response: {d[:_ERROR_DETAIL_MAX_CHARS]}"
+	)
+
+
+def _chat_final_failed(payload: dict, text: str | None) -> bool:
+	"""True when a ``state == "final"`` chat event actually represents a FAILED
+	turn that produced NO real answer. Such a "final" must surface as an error,
+	not a silent empty bubble.
+
+	The wire shapes this has to cover, verified against the shipped bundle of
+	gateway image version 2026.6.8:
+
+	  * the LIVE relay emitters (``dist/server-chat-*.js`` and
+	    ``dist/embedded-backend-*.js``, both ``emitChatFinal``) build the payload
+	    as ``{state, stopReason?, message?}``: ``stopReason`` sits at the TOP
+	    LEVEL, NOT inside ``message``, and ``message`` is OMITTED ENTIRELY when
+	    the turn produced no assistant text. A failed turn therefore reaches us
+	    as a final with NO message at all - which is exactly what both live
+	    reproductions in #543 left behind (``terminal_payload`` was
+	    ``{"text": null}`` and the assistant row's ``error`` was NULL);
+	  * the transcript-projected emitter (``broadcastChatFinal``) passes the
+	    stored assistant message straight through, so THERE ``stopReason`` rides
+	    inside ``message`` - the shape the original guard was written for.
+
+	Guards two non-failures:
+	  * a real (possibly partial) answer is kept even when the turn also flagged
+	    an error, so a streamed reply is never hidden behind an error;
+	  * a final that DOES carry an assistant message with no text and a non-error
+	    ``stopReason`` stays a normal empty-text relay:final.
+
+	A turn that produced no assistant text at all is NOT distinguishable here
+	from a hypothetical rich-output-only success - agent omits ``message``
+	for both. Surfacing the failure is the safer of the two: today's silence
+	renders a failed turn as an in-progress one that never resolves, whereas the
+	worst case in the other direction is an honest error on a turn that said
+	nothing anyway."""
+	if isinstance(text, str) and text.strip() == _STREAM_ERROR_SENTINEL:
+		return True
+	if text:
+		return False
+	if payload.get("stopReason") == "error":
+		return True
+	msg = payload.get("message")
+	if not isinstance(msg, dict):
+		return True
+	return msg.get("stopReason") == "error"
+
+
+def _is_yield_aborted_final(payload: dict, text: str | None) -> bool:
+	"""True when a ``state == "final"`` chat event is actually the agent
+	runtime's image/video/music tools' unconditional background-detach yield
+	(sessions_yield/turnHandoff), NOT a real failure or a plain empty final.
+
+	Three positive signals, checked in order of directness (live-verified,
+	2026.9.3 bundle) - ANY one is sufficient:
+	  1. an explicit top-level ``yielded`` field (truthy) on the terminal -
+	     the runtime's own, unambiguous marker;
+	  2. ``stopReason == "aborted"`` (never "error"), top-level or nested in
+	     ``message`` - the ``createYieldAbortedResponse`` shape;
+	  3. (checked by the CALLER, not here - see ``MEDIA_GEN_TOOL_NAMES``) a
+	     bare final with none of the above, tied back to a media-gen tool
+	     start seen earlier on this run - the gateway sometimes settles with
+	     no message AND no stopReason AND no ``yielded`` field at all.
+	MUST be checked BEFORE ``_chat_final_failed`` - its "no message at all"
+	branch would otherwise classify signal 1/2's omitted-``message`` shape as
+	a hard failure (FAILED_FINAL_ERROR) instead of the deferred-reply wait.
+
+	A real (possibly partial) answer always wins, same rule as
+	``_chat_final_failed``. This intentionally does NOT check for
+	``stopReason == "error"`` - that stays failed_final, unchanged."""
+	if text:
+		return False
+	if payload.get("yielded"):
+		return True
+	if payload.get("stopReason") == "aborted":
+		return True
+	msg = payload.get("message")
+	return isinstance(msg, dict) and msg.get("stopReason") == "aborted"
+
+
+# The gateway attaches a generated image/video/audio/document as a CONTENT
+# BLOCK on the final chat message, not text - the runtime's own
+# buildManagedMediaBlock: {"type":"image"|"audio"|"video", "url": ..., ...} or
+# {"type":"attachment","attachment":{"url": ..., ...}} for a document. The url
+# is a RELATIVE path served by the tenant's own gateway (same host as
+# agent_url, same bearer token Jarvis already holds) - never an absolute URL,
+# a traversal, or any other prefix.
+_MEDIA_URL_RE = re.compile(r"^/api/chat/media/outgoing/[A-Za-z0-9%._~:@-]+/[0-9a-f-]{36}/full")
+# Mirrors generated_media._MAX_MEDIA_PER_TURN (a separate cap: these blocks are
+# a distinct delivery mechanism from the native MEDIA:/embedded-path markers).
+_MAX_MEDIA_URLS_PER_TURN = 8
+
+
+def _valid_media_url(url) -> bool:
+	if not isinstance(url, str) or not url:
+		return False
+	if ".." in url or "\\" in url:
+		return False
+	return bool(_MEDIA_URL_RE.match(url))
+
+
+def _chat_final_media_urls(payload: dict) -> list[dict]:
+	"""Extract qualifying media/attachment blocks from a chat final's
+	``message.content``: ``{"url": <relative path>, "mime_type": <str|None>}``,
+	capped per turn. A block with a missing/invalid url (absolute, traversal,
+	wrong prefix) is silently skipped - never fetched, never raises."""
+	msg = payload.get("message")
+	if not isinstance(msg, dict):
+		return []
+	content = msg.get("content")
+	if not isinstance(content, list):
+		return []
+	out: list[dict] = []
+	for block in content:
+		if not isinstance(block, dict):
+			continue
+		btype = block.get("type")
+		if btype in ("image", "audio", "video"):
+			url, mime = block.get("url"), block.get("mimeType")
+		elif btype == "attachment":
+			att = block.get("attachment")
+			if not isinstance(att, dict):
+				continue
+			url, mime = att.get("url"), att.get("mimeType")
+		else:
+			continue
+		if not _valid_media_url(url):
+			continue
+		out.append({"url": url, "mime_type": mime})
+		if len(out) >= _MAX_MEDIA_URLS_PER_TURN:
+			break
+	return out
+
+
+def _persisted_device_id() -> str:
+	"""Cheap unauthenticated read of Jarvis Settings.chat_device_id.
+
+	Used by the repair convoy-collapse path to detect "someone else
+	already re-paired" without re-running the whole ensure_paired flow.
+	Returns "" if Settings is unreadable for any reason (the caller
+	treats empty as "no winner yet, proceed").
+	"""
+	import frappe
+
+	try:
+		return (frappe.db.get_single_value("Jarvis Settings", "chat_device_id") or "").strip()
+	except Exception:
+		return ""
+
+
+def _persisted_device_token() -> str:
+	"""Read of Jarvis Settings.chat_device_token (Password field).
+
+	Used by the repair path to detect "a peer already adopted a gateway-
+	reissued token for this same device" - the device_id alone can't,
+	because a token rotation keeps the device_id. Returns "" when
+	unreadable (the caller treats empty as "nothing newer, proceed")."""
+	import frappe
+
+	try:
+		s = frappe.get_single("Jarvis Settings")
+		return (s.get_password("chat_device_token", raise_exception=False) or "").strip()
+	except Exception:
+		return ""
+
+
+class AgentSession:
+	"""Direct WebSocket session to one tenant's agent gateway.
+
+	Public surface:
+	  AgentSession.connect(gateway_url) -> session
+	  session.create_session(label=...) -> session_key
+	  session.stream_agent_turn(session_key, message, idem) -> iter of parsed events
+	  session.close()
+
+	Authentication is via device pairing - the chat device's deviceToken
+	from `jarvis.chat.device.ensure_paired()` is the credential. The
+	legacy shared bearer-token path is gone.
+	"""
+
+	def __init__(self, ws: websocket.WebSocket, creds: ChatDeviceCredentials):
+		self._ws = ws
+		self._creds = creds
+		self._lock = threading.Lock()  # serialize concurrent sends on same WS
+		# The one gate every read, write and close of this socket goes through (#773).
+		self._io = _SocketIO(ws)
+
+	def _socket_io(self) -> _SocketIO:
+		# Tests build sessions with __new__ and a stubbed _ws; give those one lazily.
+		io = self.__dict__.get("_io")
+		if io is None:
+			io = self._io = _SocketIO(self._ws)
+		return io
+
+	# -- lifecycle --------------------------------------------------------
+
+	@classmethod
+	def connect(cls, gateway_url: str) -> AgentSession:
+		if not gateway_url:
+			raise AgentUnreachableError("agent_url not set on Jarvis Settings")
+		# One site per tenant: a copied site must not reach the agent.
+		site_pin.assert_not_copy()
+
+		# Two-shot self-heal for tenant re-provisioning: on the first attempt
+		# we use whatever paired creds the customer has; if agent rejects
+		# with a "your pairing is stale" marker (typical when admin replaced
+		# the container under us - new container has empty pairing state),
+		# we wipe + re-pair once and try again. A second stale signal is a
+		# real failure, not a retry candidate.
+		return cls._attempt_connect(gateway_url, allow_repair=True)
+
+	@classmethod
+	def _attempt_connect(cls, gateway_url: str, *, allow_repair: bool) -> AgentSession:
+		# Timing breakdown logged so the connection pool's win is
+		# measurable in production. Three phases:
+		#   - ensure_paired (cache hit on a paired bench, real I/O on
+		#     first run or after repair)
+		#   - WS open (DNS + TCP + TLS + WS upgrade)
+		#   - _handshake (3-phase signed connect over an open WS)
+		# The pool reuses connections, so we only pay this on pool
+		# miss / stale eviction / first turn in a worker process.
+		t_pair_start = time.monotonic()
+		creds = ensure_paired()
+		t_pair_done = time.monotonic()
+
+		# Mechanism-A tenant with no device token yet: take the connect-first
+		# bootstrap path. It presents the gateway token, drives NOT_PAIRED ->
+		# approved on its own bounded timer, and adopts the reissued device token.
+		# DISJOINT from the stale-pairing repair below: it never wipes the stable
+		# keypair (a wiped keypair mints a new deviceId every turn -> a pending the
+		# fleet-agent can never approve -> thrash, plan-check gap #3).
+		if creds.needs_bootstrap:
+			return cls._bootstrap_pair_connect(gateway_url, creds, t_pair_start=t_pair_start)
+
+		ws = cls._open_ws_with_retry(gateway_url)
+		t_ws_done = time.monotonic()
+
+		try:
+			reissued_token = cls._handshake(ws, creds)
+		except AgentUnreachableError as e:
+			try:
+				ws.close()
+			except Exception:
+				pass
+			if allow_repair and _is_stale_pairing(e):
+				cls._repair_and_reconnect(
+					gateway_url,
+					stale_device_id=creds.device_id,
+					stale_device_token=creds.device_token,
+				)
+				return cls._attempt_connect(gateway_url, allow_repair=False)
+			raise
+		except Exception:
+			try:
+				ws.close()
+			except Exception:
+				pass
+			raise
+		if reissued_token:
+			creds = cls._adopt_reissued_token(creds, reissued_token)
+		t_handshake_done = time.monotonic()
+		_logger.info(
+			"AgentSession.connect: pair_ms=%d ws_open_ms=%d handshake_ms=%d total_ms=%d gateway=%s",
+			int((t_pair_done - t_pair_start) * 1000),
+			int((t_ws_done - t_pair_done) * 1000),
+			int((t_handshake_done - t_ws_done) * 1000),
+			int((t_handshake_done - t_pair_start) * 1000),
+			gateway_url,
+		)
+		return cls(ws, creds)
+
+	@classmethod
+	def _bootstrap_pair_connect(
+		cls,
+		gateway_url: str,
+		creds: ChatDeviceCredentials,
+		*,
+		t_pair_start: float | None = None,
+	) -> AgentSession:
+		"""Connect-first device pairing (Mechanism A).
+
+		The bench has a stable keypair but NO device token. It presents the
+		gateway token (``auth.token``) on a signed connect; agent answers
+		NOT_PAIRED and opens a durable pending request (and closes the socket with
+		a pauseReconnect hint). The CP has already told the fleet-agent to poll +
+		approve this deviceId. We ignore the pause and reconnect on our own timer
+		until the approval lands, at which point agent issues the device token
+		on ``hello-ok.auth.deviceToken`` and we adopt it (steady state from there).
+
+		DISJOINT from the stale-pairing self-heal (``_repair_and_reconnect``): this
+		NEVER wipes the keypair. Wiping it would mint a new deviceId every turn ->
+		a moving target the fleet-agent can never approve (thrash, plan-check gap
+		#3). Token-absent is a valid state; the keypair stays put and the pending is
+		re-found/re-created each turn until approved.
+
+		Bounded (D-e): ONE episode per turn-that-needs-pairing, capped at
+		PAIRING_APPROVAL_DEADLINE_SECONDS (well inside the 5-min pending TTL and the
+		chat-turn budget). Fail-CLOSED at the cap (D-d): raise the honest
+		"still getting ready" error, NEVER fabricate a token.
+		"""
+		if not creds.bootstrap_token:
+			# Can neither present nor sign a bootstrap connect without the gateway
+			# token. Fail closed rather than send an unsignable/empty auth.
+			raise AgentUnreachableError(
+				"device pairing needs the gateway token but none is set",
+				code="pairing-no-bootstrap-token",
+			)
+
+		t_start = t_pair_start if t_pair_start is not None else time.monotonic()
+		deadline = time.monotonic() + PAIRING_APPROVAL_DEADLINE_SECONDS
+		attempt = 0
+		while True:
+			attempt += 1
+			ws = cls._open_ws_with_retry(gateway_url)
+			try:
+				reissued_token = cls._handshake(ws, creds)
+			except AgentUnreachableError as e:
+				try:
+					ws.close()
+				except Exception:
+					pass
+				if _is_not_paired(e):
+					# Still pending. Reconnect on our own timer within the deadline;
+					# agent's pauseReconnect hint is deliberately ignored.
+					if time.monotonic() < deadline:
+						_logger.info(
+							"chat pairing: pending approval device_id=%s attempt=%d elapsed_ms=%d",
+							creds.device_id,
+							attempt,
+							int((time.monotonic() - t_start) * 1000),
+						)
+						time.sleep(PAIRING_RECONNECT_BACKOFF_SECONDS)
+						continue
+					# Cap reached: fail closed (D-d). This is the new NOT_PAIRED
+					# branch's own distinct log line (D-f).
+					_logger.warning(
+						"chat pairing: NOT approved within %ss device_id=%s attempts=%d - failing closed",
+						PAIRING_APPROVAL_DEADLINE_SECONDS,
+						creds.device_id,
+						attempt,
+					)
+					raise AgentUnreachableError(
+						PAIRING_PENDING_USER_MESSAGE,
+						code="pairing-pending",
+					) from e
+				# Any non-NOT_PAIRED failure is a real error - do NOT loop on it.
+				raise
+			except Exception:
+				try:
+					ws.close()
+				except Exception:
+					pass
+				raise
+
+			# hello-ok arrived: the pending was approved and the gateway issued the
+			# device token. Adopt it (persist + in-memory) and proceed steady-state.
+			if not reissued_token:
+				try:
+					ws.close()
+				except Exception:
+					pass
+				_logger.warning(
+					"chat pairing: approved connect issued NO device token device_id=%s - failing closed",
+					creds.device_id,
+				)
+				raise AgentUnreachableError(
+					PAIRING_PENDING_USER_MESSAGE,
+					code="pairing-no-token",
+				)
+			creds = cls._adopt_reissued_token(creds, reissued_token)
+			_logger.info(
+				"chat pairing: approved device_id=%s attempts=%d total_ms=%d gateway=%s",
+				creds.device_id,
+				attempt,
+				int((time.monotonic() - t_start) * 1000),
+				gateway_url,
+			)
+			return cls(ws, creds)
+
+	@classmethod
+	def _open_ws_with_retry(cls, gateway_url: str):
+		"""Open the gateway WebSocket, retrying network-level failures.
+
+		Only the WS OPEN phase (DNS + TCP + TLS + upgrade) is retried, and only
+		for network-level failures (WebSocketException / OSError, e.g. a connect
+		timeout or refused connection) - so a dormant / recreating container
+		(unreachable ~10-30s) does not fail the user's first turn. Handshake and
+		auth failures happen later and are NOT retried here. Retries stop once
+		CONNECT_OPEN_DEADLINE_SECONDS has elapsed; a warm gateway returns on the
+		first attempt.
+		"""
+		deadline = time.monotonic() + CONNECT_OPEN_DEADLINE_SECONDS
+		attempt = 0
+		while True:
+			attempt += 1
+			try:
+				return websocket.create_connection(
+					gateway_url,
+					timeout=CONNECT_TIMEOUT_SECONDS,
+					# Origin must be in agent's controlUi.allowedOrigins, which
+					# the LAN-bound gateway enforces + seeds (see _GATEWAY_ORIGIN).
+					origin=_GATEWAY_ORIGIN,
+				)
+			except (websocket.WebSocketException, OSError) as e:
+				if time.monotonic() >= deadline:
+					raise AgentUnreachableError(
+						f"WS open failed after {attempt} attempt(s) in "
+						f"{CONNECT_OPEN_DEADLINE_SECONDS}s - the assistant may be "
+						f"starting up; please try again in a moment ({e})"
+					) from e
+				time.sleep(CONNECT_OPEN_RETRY_BACKOFF_SECONDS)
+
+	@classmethod
+	def _adopt_reissued_token(
+		cls,
+		creds: ChatDeviceCredentials,
+		reissued_token: str,
+	) -> ChatDeviceCredentials:
+		"""Adopt a device token the gateway rotated at connect (hello-ok
+		``auth.deviceToken``). The rotation is already persisted gateway-
+		side, so we persist our half too; failing that, we still use the
+		fresh token in-memory for this session and let the stale-pairing
+		self-heal recover the NEXT connect (a persistence hiccup must not
+		fail the user's current turn)."""
+		import dataclasses
+
+		try:
+			persisted = update_device_token(
+				reissued_token,
+				device_id=creds.device_id,
+			)
+			if not persisted:
+				# Another worker re-paired while we were connecting;
+				# Settings holds a newer device's creds. Ours still work
+				# for THIS session - don't clobber theirs.
+				_logger.warning(
+					"gateway reissued device token for %s but Settings "
+					"moved to a different pairing; kept in-memory only",
+					creds.device_id,
+				)
+		except Exception:
+			_logger.warning(
+				"failed to persist reissued device token for %s; kept "
+				"in-memory only (self-heal will re-pair on next connect)",
+				creds.device_id,
+				exc_info=True,
+			)
+		return dataclasses.replace(creds, device_token=reissued_token)
+
+	@classmethod
+	def _repair_and_reconnect(
+		cls,
+		gateway_url: str,
+		*,
+		stale_device_id: str,
+		stale_device_token: str = "",
+	) -> None:
+		"""Serialize the clear+re-pair window after a stale-pairing rejection.
+
+		Sprint-2 (2026-06-16 review): with N concurrent chat workers
+		racing after a tenant re-provision, every one observes the same
+		"stale pairing" error, every one called ``clear_credentials() +
+		ensure_paired()``, every one generated a different Ed25519
+		keypair, and only the last writer's keypair survived in Jarvis
+		Settings - the other N-1 workers held in-memory creds the admin
+		side didn't know about, then EACH of them re-paired again,
+		flapping admin/gateway state. The Redis lock collapses the
+		convoy: one worker re-pairs, the rest wait, then read the fresh
+		keypair from Settings.
+
+		``stale_device_id`` is the device_id we just observed as stale.
+		If by the time we acquire the lock the persisted device_id no
+		longer matches, the winning worker already re-paired - we skip
+		the wipe entirely and the caller's next ``ensure_paired`` reads
+		the new creds.
+		"""
+		from jarvis._redis_lock import redis_lock
+
+		with redis_lock(
+			"chat_device_pair_repair",
+			timeout_s=120,
+			blocking_timeout_s=60.0,
+		) as acquired:
+			# Even if we lost the lock race, we still want to retry the
+			# connect once with fresh creds - the holder may have already
+			# repaired. Let the caller re-read on its next attempt.
+			if not acquired:
+				return
+			current = _persisted_device_id()
+			if current and current != stale_device_id:
+				# Another worker already re-paired while we waited. Don't
+				# wipe their work; let the caller re-read.
+				return
+			# A gateway token ROTATION keeps the device_id, so the id check
+			# alone can't see that a peer just adopted the reissued token
+			# (hello-ok auth.deviceToken) while our rejected connect was in
+			# flight with the pre-rotation token. If the persisted token
+			# moved on from the one we presented, the pairing is already
+			# healed - retrying with the fresh creds beats destroying them
+			# and paying a full re-pair round-trip.
+			persisted_token = _persisted_device_token()
+			if stale_device_token and persisted_token and persisted_token != stale_device_token:
+				return
+			clear_credentials()
+			# Don't prime ensure_paired() here: the caller's next
+			# _attempt_connect(allow_repair=False) calls ensure_paired
+			# on its own which is what generates+persists the new
+			# keypair under our lock. Late convoy followers also call
+			# ensure_paired on their own next attempt and see the
+			# newly-persisted creds without re-pairing.
+
+	def close(self) -> None:
+		"""Graceful close (CLOSE frame, bounded), or an abort when another operation
+		holds the socket. Idempotent; the descriptor closes once nothing uses it."""
+		try:
+			self._socket_io().close_graceful()
+		except Exception:
+			pass
+
+	def abort_transport(self) -> None:
+		"""Poison the socket from any thread without waiting: blocked reads and writes
+		return at once and every later write is ``SendNotStarted``."""
+		self._socket_io().abort()
+
+	# -- protocol methods -------------------------------------------------
+
+	def create_session(self, label: str = "jarvis-chat") -> str:
+		params = {"label": label}
+		try:
+			res = self._request("sessions.create", params, timeout_s=CONNECT_TIMEOUT_SECONDS)
+		except AgentUnreachableError as e:
+			# agent 2026.9+ makes a MULTI-AGENT roster (>=1 marketplace-agent
+			# delegate installed) reject an unscoped session and demand the caller
+			# name an agent. Retry naming the primary agent (the fleet-agent template
+			# keys it "main" - see _PRIMARY_AGENT_ID). Kept as a fallback rather than
+			# sent upfront so single-agent tenants and pre-2026.9 gateways - whose
+			# sessions.create rejects an unknown agentId - are untouched.
+			#
+			# agent sends only the GENERIC code "INVALID_REQUEST" with details=None
+			# for this (verified against 2026.9.3), so - unlike the structured
+			# _STALE_PAIRING_* classifier above - the code alone can't distinguish it
+			# from other INVALID_REQUEST rejections; the message substring is the only
+			# specific signal available. Gate on both (code narrows the class, prose
+			# pins the case). test_chat_agent_client pins the exact wire message so a
+			# future reword breaks CI instead of silently disabling the retry; if a
+			# later image adds a structured reason, prefer it.
+			if e.code != "INVALID_REQUEST" or "no explicit owner" not in str(e).lower():
+				raise
+			res = self._request(
+				"sessions.create",
+				{**params, "agentId": _PRIMARY_AGENT_ID},
+				timeout_s=CONNECT_TIMEOUT_SECONDS,
+			)
+		key = (res.get("payload") or {}).get("key")
+		if not key:
+			raise AgentUnreachableError(f"sessions.create returned no key: {res}")
+		return key
+
+	# -- Gateway-native turn model (chat.send + chat.history + sessions.*) --
+	# Mirrors agent's own UI gateway client so the bench can drive a turn
+	# and reconcile from the durable transcript instead of holding the agent
+	# RPC's request stream. Each method below is a plain request/response.
+
+	def chat_send(
+		self,
+		session_key: str,
+		message: str,
+		idempotency_key: str,
+		*,
+		thinking: str | None = None,
+		deliver: bool = False,
+		attachments: list[dict] | None = None,
+		timeout_s: float = CONNECT_TIMEOUT_SECONDS,
+		verified_session_id: str | None = None,
+		event_observer: Callable[[dict], None] | None = None,
+	) -> dict:
+		"""Start an agent turn via chat.send (agent's UI turn-start RPC).
+
+		Returns the ack payload, e.g. {"runId": ..., "status": "in_flight"}.
+		The turn's output is delivered as session-scoped "chat" events (consume
+		them via the relay after subscribe_session), NOT on this response.
+		deliver=False keeps the result session-only (no external channel
+		delivery), matching the current chat path."""
+		if ":dashboard:collab:" in session_key and not verified_session_id:
+			raise AgentUnreachableError(
+				"Shared chat requires a verified existing runtime session.",
+				code="collaboration_policy_required",
+			)
+		params: dict = {
+			"sessionKey": session_key,
+			"message": message,
+			"idempotencyKey": idempotency_key,
+			"deliver": deliver,
+		}
+		if thinking:
+			params["thinking"] = thinking
+		if attachments:
+			params["attachments"] = attachments
+		if verified_session_id:
+			params.update(
+				sessionId=verified_session_id,
+				expectedPermissionMode="read-only",
+			)
+		if event_observer is not None and ":dashboard:collab:" in session_key:
+
+			def observe(frame):
+				payload = frame.get("payload") or {}
+				if (
+					frame.get("type") != "event"
+					or frame.get("event") != "agent"
+					or payload.get("runId") != idempotency_key
+					or payload.get("sessionKey") not in (None, session_key)
+				):
+					return
+				parsed = parse_event(payload, collaboration=True)
+				if parsed and parsed.get("kind") == "tool_boundary" and parsed.get("tool_call_id"):
+					parsed = {**parsed, "kind": "tool", "phase": "start"}
+				if parsed and parsed.get("kind") == "tool":
+					event_observer(parsed)
+
+			res = self._request("chat.send", params, timeout_s=timeout_s, event_observer=observe)
+		else:
+			res = self._request("chat.send", params, timeout_s=timeout_s)
+		return res.get("payload") or {}
+
+	def chat_abort(
+		self,
+		session_key: str,
+		run_id: str | None = None,
+		*,
+		timeout_s: float = CONNECT_TIMEOUT_SECONDS,
+	) -> dict:
+		"""Abort in-flight run(s) on a session (agent chat.abort). With no
+		run_id, aborts ALL active runs on the session (safe here: one active run
+		per conversation). The gateway authorizes this from any connection
+		presenting the shared device id + operator scope, so the web process can
+		abort a run the RQ worker started - the two coordinate via the gateway's
+		broadcast (the worker's blocked relay receives the aborted event and
+		terminates)."""
+		params: dict = {"sessionKey": session_key}
+		if run_id:
+			params["runId"] = run_id
+		return self._request("chat.abort", params, timeout_s=timeout_s)
+
+	def compact_session(
+		self,
+		session_key: str,
+		hint: str | None = None,
+		*,
+		timeout_s: float = 200.0,
+	) -> dict:
+		"""Compact one session by sending the runtime's text command
+		``/compact <hint>`` through chat.send (the ONLY surface that accepts a
+		hint; the sessions.compact RPC has none). The command path emits no
+		agent lifecycle frames, only session.message frames and one ``chat``
+		event with a terminal state, so this waits for THAT and nothing else.
+		Verified live 2026-09-05: about 6 s, notice text
+		"⚙️ Compacted (58k before) • Context 58k/200k (29%)"."""
+		message = "/compact" + (f" {hint.strip()}" if hint and hint.strip() else "")
+		run_id = uuid.uuid4().hex
+		self.subscribe_session(session_key)
+		ack = self.chat_send(session_key, message, run_id, timeout_s=CONNECT_TIMEOUT_SECONDS)
+		rid = ack.get("runId") or run_id
+		deadline = time.monotonic() + timeout_s
+		while time.monotonic() < deadline:
+			try:
+				frame = self._recv(min(5.0, max(deadline - time.monotonic(), 0.01)))
+			except AgentUnreachableError as e:
+				# A hard close after the ack is the same "sent it, never heard
+				# back" outcome as a plain timeout (the command may have
+				# landed) - recode a codeless close so the caller's
+				# code == "compact-timeout" check still routes it that way.
+				if getattr(e, "code", None):
+					raise
+				raise AgentUnreachableError(str(e), code="compact-timeout") from e
+			if not frame or frame.get("type") != "event" or frame.get("event") != "chat":
+				continue
+			payload = frame.get("payload") or {}
+			if payload.get("runId") != rid or payload.get("sessionKey") != session_key:
+				continue
+			state = payload.get("state")
+			if state == "final":
+				return {"state": "final", "text": _chat_final_text(payload), "run_id": rid}
+			if state in ("error", "aborted"):
+				return {"state": state, "text": str(payload.get("errorMessage") or state), "run_id": rid}
+		raise AgentUnreachableError("compact timed out", code="compact-timeout")
+
+	def subscribe_session(
+		self,
+		session_key: str,
+		*,
+		timeout_s: float = CONNECT_TIMEOUT_SECONDS,
+	) -> dict:
+		"""Subscribe THIS connection to a session's message events via
+		sessions.messages.subscribe. After this the WS receives the session's
+		message event frames going forward. agent keeps no per-run delta
+		buffer, so this yields only FUTURE events - catch up via get_history /
+		get_session_messages on (re)connect."""
+		res = self._request(
+			"sessions.messages.subscribe",
+			{"key": session_key},
+			timeout_s=timeout_s,
+		)
+		return res.get("payload") or {}
+
+	def get_history(
+		self,
+		session_key: str,
+		*,
+		limit: int = 100,
+		max_chars: int = 4000,
+		timeout_s: float = CONNECT_TIMEOUT_SECONDS,
+	) -> dict:
+		"""Snapshot the session's DISPLAY transcript via chat.history. Returns
+		{"sessionId", "messages", "thinkingLevel"} - the same projected display
+		messages agent's UI renders. The authoritative source of truth used
+		to reconcile after a timeout / reconnect."""
+		res = self._request(
+			"chat.history",
+			{"sessionKey": session_key, "limit": limit, "maxChars": max_chars},
+			timeout_s=timeout_s,
+		)
+		return res.get("payload") or {}
+
+	def get_session_messages(
+		self,
+		session_key: str,
+		*,
+		limit: int = 50,
+		timeout_s: float = CONNECT_TIMEOUT_SECONDS,
+	) -> list:
+		"""Raw recent transcript tail via sessions.get. Returns the messages
+		list (each: role, content, runtime metadata containing seq and id); [] for an unknown or
+		empty session."""
+		res = self._request(
+			"sessions.get",
+			{"key": session_key, "limit": limit},
+			timeout_s=timeout_s,
+		)
+		return (res.get("payload") or {}).get("messages") or []
+
+	def is_run_active(
+		self,
+		session_key: str,
+		*,
+		timeout_s: float = CONNECT_TIMEOUT_SECONDS,
+	) -> bool:
+		"""Non-destructive done-signal: True iff the gateway is tracking an
+		in-flight run for session_key. Reads sessions.list and matches
+		hasActiveRun on the row whose key == session_key. (Do NOT use
+		sessions.abort for this - it kills the run.)"""
+		res = self._request("sessions.list", {}, timeout_s=timeout_s)
+		sessions = (res.get("payload") or {}).get("sessions") or []
+		for s in sessions:
+			if s.get("key") == session_key:
+				return bool(s.get("hasActiveRun"))
+		return False
+
+	def list_sessions(
+		self,
+		*,
+		timeout_s: float = CONNECT_TIMEOUT_SECONDS,
+	) -> list[dict]:
+		"""Every session the gateway is tracking (sessions.list rows:
+		key, hasActiveRun, updatedAt, label, ...). Used by the session
+		lifecycle sweep to find orphaned throwaway sessions."""
+		res = self._request("sessions.list", {}, timeout_s=timeout_s)
+		return (res.get("payload") or {}).get("sessions") or []
+
+	def list_sessions_page(
+		self,
+		*,
+		limit: int = 100,
+		offset: int = 0,
+		timeout_s: float = CONNECT_TIMEOUT_SECONDS,
+	) -> dict:
+		"""One page of ``sessions.list`` with the WHOLE payload, not just the
+		rows: ``sessions`` plus ``defaults`` (the agent's configured model, i.e.
+		what an unpinned session resolves to) and ``hasMore`` / ``nextOffset``.
+
+		``list_sessions`` above drops the envelope and accepts the gateway's own
+		100-row cap. The model-pin sweep needs both halves: ``defaults`` is the
+		only way to tell a pinned session from an unpinned one over the wire
+		(the row carries the RESOLVED model, never the raw override), and a
+		tenant with a long history needs the paging cursor."""
+		res = self._request(
+			"sessions.list",
+			{"limit": limit, "offset": offset},
+			timeout_s=timeout_s,
+		)
+		return res.get("payload") or {}
+
+	def clear_session_model(
+		self,
+		session_key: str,
+		*,
+		timeout_s: float = CONNECT_TIMEOUT_SECONDS,
+	) -> dict:
+		"""Drop the session's model override so the agent's configured default -
+		and, crucially, its ``model.fallbacks`` chain - applies again.
+
+		``sessions.patch`` with a NULL model takes agent's own isDefault
+		branch (2026.6.8 ``src/sessions/model-overrides.ts``), which deletes
+		``modelOverride``, ``providerOverride`` and ``modelOverrideSource``
+		together with the now-stale runtime model/contextTokens fields, then
+		persists through the gateway's own store writer. Rewriting
+		``sessions.json`` on disk instead would race that writer: the gateway
+		holds the store in memory and rewrites it on every session update.
+
+		Returns the gateway's post-patch store entry (``payload.entry``) so the
+		caller can VERIFY the override is gone instead of trusting the ack.
+
+		NEVER call this for a key the gateway did not just report. Patching an
+		ABSENT key does not fail - agent creates the entry, mints a fresh
+		sessionId and drops the label."""
+		res = self._request(
+			"sessions.patch",
+			{"key": session_key, "model": None},
+			timeout_s=timeout_s,
+		)
+		return (res.get("payload") or {}).get("entry") or {}
+
+	def delete_session(
+		self,
+		session_key: str,
+		*,
+		timeout_s: float = CONNECT_TIMEOUT_SECONDS,
+	) -> None:
+		"""Remove a session's gateway state via ``sessions.delete``
+		(transcript is archived gateway-side first; ``deleteTranscript``
+		defaults true there). The gateway refuses to delete the agent's
+		main session - callers treat that error as a skip, never retry."""
+		self._request(
+			"sessions.delete",
+			{"key": session_key},
+			timeout_s=timeout_s,
+		)
+
+	def set_session_model(
+		self,
+		session_key: str,
+		model_ref: str | None,
+		*,
+		timeout_s: float = CONNECT_TIMEOUT_SECONDS,
+	) -> None:
+		"""Point the session at ``model_ref`` (``"<provider>/<model>"`` or
+		bare ``"<model>"``) via ``sessions.patch``. chat.send has no per-turn
+		model param, so per-conversation overrides are applied to the session
+		before the send.
+
+		``model_ref=None`` sends ``{"model": null}``, which agent's ``isDefault``
+		branch answers by DELETING the session's modelOverride, providerOverride and
+		modelOverrideSource. Use it to RESET a session to the agent's configured
+		default: an unoverridden session is the only shape that keeps
+		``agents.defaults.model.fallbacks`` live, because
+		``resolveEffectiveModelFallbacks`` returns ``[]`` for any override not marked
+		``modelOverrideSource: "auto"`` -- and that marker is not in the sessions.patch
+		schema (the gateway rejects it with INVALID_REQUEST), so not overriding is the
+		supported way to preserve failover. See ``turn_handler._session_model_for``."""
+		self._request(
+			"sessions.patch",
+			{"key": session_key, "model": model_ref},
+			timeout_s=timeout_s,
+		)
+
+	def relay_turn_events(
+		self,
+		session_key: str,
+		run_id: str,
+		*,
+		soft_deadline_s: float = TURN_TIMEOUT_SECONDS,
+	) -> Iterator[dict[str, Any]]:
+		"""Consume broadcast events for a chat.send run until a terminal
+		``chat`` event, the soft deadline, or a transport drop.
+
+		Mirror of agent's own UI model: token/tool streaming comes from
+		the broadcast ``agent`` frames (retagged with the chat.send
+		clientRunId == run_id); completion comes ONLY from the run-scoped
+		``chat`` event (state final|aborted|error). agent ``lifecycle``
+		frames are dropped so there is a single terminal path.
+
+		NEVER raises after entry. Terminal yields:
+		  {"kind": "relay:final", "text": str|None}
+		  {"kind": "relay:error", "state": "error"|"aborted"|"failed_final", "error": str}
+		  {"kind": "relay:interrupted", "reason": "transport"|"deadline", ...}
+
+		A ``state == "final"`` event whose assistant turn actually failed
+		(no assistant message at all, stopReason error, stream-error sentinel)
+		is remapped to a ``failed_final`` relay:error so it stamps an honest
+		error instead of a silent empty final, naming the provider reason from
+		the run's lifecycle error frame when there was one. See
+		_chat_final_failed / failed_final_error.
+		"""
+		deadline = time.monotonic() + soft_deadline_s
+		# Last lifecycle error text seen for this run. NOT terminal on its own
+		# (the chat event is the single terminal path); it is the only frame
+		# that names the provider failure, so it is kept for a failed final.
+		failure_detail: str | None = None
+		# True once a media-generation tool call started this run - see
+		# MEDIA_GEN_TOOL_NAMES. Turns a would-be failed_final bare terminal into
+		# a yield instead (the two are wire-identical without this history).
+		saw_media_tool_start = False
+		while True:
+			remaining = deadline - time.monotonic()
+			if remaining <= 0:
+				yield {"kind": "relay:interrupted", "reason": "deadline"}
+				return
+			try:
+				frame = self._recv(remaining)
+			except AgentUnreachableError as e:
+				# Close the dead WS before yielding: this generator swallows
+				# the exception by design, so the pool's discard-on-exception
+				# contract never fires. Closing flips the connected flag the
+				# pool healthcheck reads, so the corpse is not handed to the
+				# next turn (which would fail pre-ack as a false run:error).
+				try:
+					self.close()
+				except Exception:
+					pass
+				yield {"kind": "relay:interrupted", "reason": "transport", "detail": str(e)}
+				return
+			if frame is None or frame.get("type") != "event":
+				continue
+			payload = frame.get("payload") or {}
+			if frame.get("event") == "chat":
+				if payload.get("runId") != run_id or payload.get("sessionKey") != session_key:
+					continue
+				state = payload.get("state")
+				if state == "final":
+					text = _chat_final_text(payload)
+					# The runtime's image/video/music tools' unconditional
+					# background-detach yield reaches THIS path too (not only
+					# state=="aborted" below): a `final` whose text is empty and
+					# whose stopReason (top-level or nested in message) is
+					# "aborted", not "error". Route it through the SAME
+					# relay:error/aborted shape the state=="aborted" branch
+					# yields, so the caller's yield-wait applies unchanged.
+					# MUST be checked before _chat_final_failed - that guard's
+					# "no message at all" branch would otherwise call this a
+					# hard failure instead of a deferred reply.
+					failed = _chat_final_failed(payload, text)
+					if _is_yield_aborted_final(payload, text) or (failed and saw_media_tool_start):
+						yield {"kind": "relay:error", "state": "aborted", "text": ""}
+						return
+					# A "final" whose assistant turn actually FAILED (stopReason
+					# error / stream-error sentinel) is surfaced as a terminal
+					# error, not a silent empty bubble. See _chat_final_failed.
+					if failed:
+						yield {
+							"kind": "relay:error",
+							"state": "failed_final",
+							"error": failed_final_error(failure_detail),
+						}
+						return
+					# Not a failed-final -> consume the MEDIA marker, redact the surfaced
+					# reply + fire the once-per-turn tripwire (classification ran on raw
+					# text). media_rels rides the terminal so the worker seeds the image.
+					_red, _rels, _marked = egress_rules.redact_final_with_media(text, run_id=run_id)
+					_final = {"kind": "relay:final", "text": _red}
+					if _rels:  # fetchable media -> seed downstream (only set when present)
+						_final["media_rels"] = _rels
+					if _marked:  # any MEDIA: line stripped -> force the content overwrite
+						_final["marker_stripped"] = True
+					_urls = _chat_final_media_urls(payload)
+					if _urls:  # gateway-attached image/video/audio/document content blocks
+						_final["media_urls"] = _urls
+					yield _final
+					return
+				if state in ("error", "aborted"):
+					# ``text`` lets the caller tell a runtime-yield abort (empty)
+					# from a genuine partial-content abort - see
+					# relay_yield_continuation. Absent for a plain error/aborted
+					# today, so this is a harmless addition for every OTHER caller.
+					yield {
+						"kind": "relay:error",
+						"state": state,
+						"error": egress_rules.redact(payload.get("errorMessage") or state),
+						"text": _chat_final_text(payload) or "",
+					}
+					return
+				continue  # delta (150ms cumulative mirror) and unknown states: ignore
+			if payload.get("runId") != run_id:
+				continue
+			parsed = parse_event(payload, collaboration=":dashboard:collab:" in session_key)
+			if parsed and parsed.get("kind") == "tool_boundary" and parsed.get("tool_call_id"):
+				parsed = {**parsed, "kind": "tool", "phase": "start"}
+			if parsed is None or parsed.get("kind") == "lifecycle":
+				# lifecycle frames stay off the terminal path, but the ``error``
+				# phase carries the runtime's own user-facing failure text - the
+				# only place the provider reason is ever named. Keep it for a
+				# failed final; a real answer still wins over it (#543).
+				if parsed is not None and parsed.get("phase") == "error" and parsed.get("error"):
+					failure_detail = str(parsed["error"])
+				continue
+			if (
+				parsed.get("kind") == "tool"
+				and parsed.get("phase") == "start"
+				and parsed.get("tool_name") in MEDIA_GEN_TOOL_NAMES
+			):
+				saw_media_tool_start = True
+			yield parsed
+
+	def relay_yield_continuation(
+		self,
+		session_key: str,
+		*,
+		soft_deadline_s: float,
+		cancel_check: Any = None,
+	) -> dict[str, Any]:
+		"""Wait for the follow-up ``chat`` terminal a runtime-yield abort
+		(``relay_turn_events``' empty ``state == "aborted"``) posts on the SAME
+		``session_key`` under a FRESH runId (the runtime's image/video/music tools
+		unconditionally detach into a background task and restart the session
+		~25-30s later - see ``YIELD_CONTINUATION_WAIT_S``). Matches on
+		``sessionKey`` alone (the runId is unknown ahead of time).
+
+		Polls in ``YIELD_CONTINUATION_POLL_S`` chunks and calls ``cancel_check``
+		(when given) between them, so a user Stop pressed mid-wait is observed
+		promptly - the dead original runId will never itself post another frame,
+		so nothing on the wire would otherwise tell this loop to give up.
+
+		Non-``chat`` frames (the continuation's own tool/delta events) are
+		dropped: this call surfaces only the continuation's OUTCOME, not its
+		live stream - the deferred tool call already ran out of band and the
+		user was never shown it running.
+
+		NEVER raises. Terminal yields (mirrors ``relay_turn_events``):
+		  {"kind": "relay:final", "text": str, media_rels?: [...], marker_stripped?: True}
+		  {"kind": "relay:error", "state": "error"|"aborted"|"failed_final", "error": str}
+		  {"kind": "relay:interrupted", "reason": "deadline"|"transport"|"cancelled"}
+		"""
+		deadline = time.monotonic() + max(0.0, soft_deadline_s)
+		while True:
+			if cancel_check is not None and cancel_check():
+				return {"kind": "relay:interrupted", "reason": "cancelled"}
+			remaining = deadline - time.monotonic()
+			if remaining <= 0:
+				return {"kind": "relay:interrupted", "reason": "deadline"}
+			try:
+				frame = self._recv(min(YIELD_CONTINUATION_POLL_S, remaining))
+			except AgentUnreachableError as e:
+				try:
+					self.close()
+				except Exception:
+					pass
+				return {"kind": "relay:interrupted", "reason": "transport", "detail": str(e)}
+			if frame is None or frame.get("type") != "event" or frame.get("event") != "chat":
+				continue
+			payload = frame.get("payload") or {}
+			if payload.get("sessionKey") != session_key:
+				continue
+			state = payload.get("state")
+			if state == "final":
+				text = _chat_final_text(payload)
+				if _chat_final_failed(payload, text):
+					return {
+						"kind": "relay:error",
+						"state": "failed_final",
+						"error": failed_final_error(None),
+					}
+				_red, _rels, _marked = egress_rules.redact_final_with_media(text, run_id=payload.get("runId"))
+				out: dict[str, Any] = {"kind": "relay:final", "text": _red}
+				if _rels:
+					out["media_rels"] = _rels
+				if _marked:
+					out["marker_stripped"] = True
+				_urls = _chat_final_media_urls(payload)
+				if _urls:  # gateway-attached image/video/audio/document content blocks
+					out["media_urls"] = _urls
+				# Marks this as the yield's continuation outcome (not an ordinary
+				# turn) so the caller's post-settle rich-output step knows it may
+				# need to harvest the actual media from separate later transcript
+				# messages when neither media_rels nor media_urls landed here -
+				# see turn_handler._harvest_post_yield_media.
+				out["yield_continuation"] = True
+				return out
+			if state in ("error", "aborted"):
+				return {
+					"kind": "relay:error",
+					"state": state,
+					"error": egress_rules.redact(payload.get("errorMessage") or state),
+					"text": _chat_final_text(payload) or "",
+				}
+			continue  # delta (cumulative mirror) / unknown chat states: keep waiting
+
+	def fire_agent(
+		self,
+		session_key: str,
+		message: str,
+		idempotency_key: str,
+		*,
+		model: str | None = None,
+		provider: str | None = None,
+	) -> str:
+		"""Send one agent turn and return its runId after the ack, WITHOUT
+		consuming the event stream. agent keeps running the turn server
+		side after we close (the run lane survives client disconnect), so this
+		is enough to warm the provider prompt cache. ``deliver`` is False so
+		the result stays session-only. ``_request`` drops the interleaved
+		event frames and returns the agent ack response.
+
+		Setting ``model`` / ``provider`` disables agent's failover for this
+		run - see PINNED_ONESHOT_RUN_PREFIX."""
+		params = {
+			"message": message,
+			"sessionKey": session_key,
+			"deliver": False,
+			"idempotencyKey": idempotency_key,
+		}
+		if model:
+			params["model"] = model
+		if provider:
+			params["provider"] = provider
+		if model or provider:
+			_log_pinned_oneshot(idempotency_key, model, provider)
+		res = self._request("agent", params, timeout_s=CONNECT_TIMEOUT_SECONDS)
+		return (res.get("payload") or {}).get("runId") or ""
+
+	def stream_agent_turn(
+		self,
+		session_key: str,
+		message: str,
+		idempotency_key: str,
+		*,
+		model: str | None = None,
+		provider: str | None = None,
+		attachments: list[dict] | None = None,
+	) -> Iterator[dict[str, Any]]:
+		"""Send an `agent` request, then yield parsed events until lifecycle.end.
+
+		`model` / `provider` are optional per-turn overrides. When set, they
+		flow into agent's agent RPC params; the gateway honours them via
+		the operator.admin-scope-gated modelOverride path (our connect already
+		declares that scope), and the run loses its failover chain for the
+		duration - see PINNED_ONESHOT_RUN_PREFIX. When omitted, agent falls
+		back to agents.defaults.model.primary from agent configuration AND keeps its
+		fallbacks.
+
+		Yields the same parsed-event shape the worker used to consume from
+		the subprocess. Raises AgentUnreachableError on WS drop, agent
+		errors, or timeout - all the failure modes worker.py already maps to
+		assistant-message error rows."""
+		if ":dashboard:collab:" in session_key:
+			raise AgentUnreachableError("Shared sessions require a verified chat.send transport.")
+		params = {
+			"message": message,
+			"sessionKey": session_key,
+			"deliver": False,
+			"idempotencyKey": idempotency_key,
+		}
+		if model:
+			params["model"] = model
+		if provider:
+			params["provider"] = provider
+		if attachments:
+			# Native vision input. agent's `agent` handler reads these and
+			# normalizes them to the active provider's image blocks; the flat
+			# {type:"image", mimeType, fileName, content:<base64>} shape is what
+			# its gateway normalizer accepts.
+			params["attachments"] = attachments
+		if model or provider:
+			_log_pinned_oneshot(idempotency_key, model, provider)
+		agent_id = self._send("agent", params)
+		deadline = time.monotonic() + TURN_TIMEOUT_SECONDS
+
+		# 1. Drain frames until we see the agent ack OR an error/event for our run.
+		active_run_id: str | None = None
+		got_ack = False
+		while time.monotonic() < deadline:
+			frame = self._recv(deadline - time.monotonic())
+			if frame is None:
+				continue
+			ftype = frame.get("type")
+			if ftype == "res" and frame.get("id") == agent_id:
+				if not frame.get("ok"):
+					err = frame.get("error") or {}
+					details = err.get("details")
+					raise AgentUnreachableError(
+						f"agent rejected: {err.get('code', '?')}: {err.get('message', '')}",
+						code=err.get("code"),
+						details=details if isinstance(details, dict) else None,
+					)
+				active_run_id = (frame.get("payload") or {}).get("runId")
+				got_ack = True
+				break
+			# Pre-ack events can arrive; pass them through if they belong to us
+			# by lifecycle (no runId yet at this point, drop unrelated noise).
+		if not got_ack:
+			raise AgentUnreachableError("agent RPC never acknowledged")
+
+		# 2. Stream events for this run until lifecycle.end / .error.
+		# The run has started (we have the ack); a WS drop from here is
+		# RECOVERABLE - agent keeps running and persists the result - so tag
+		# it code="turn-timeout" to park for recovery, never a false error (#4).
+		while time.monotonic() < deadline:
+			try:
+				frame = self._recv(deadline - time.monotonic())
+			except AgentUnreachableError as e:
+				if getattr(e, "code", None):
+					raise
+				raise AgentUnreachableError(str(e), code="turn-timeout") from e
+			if frame is None:
+				continue
+			ftype = frame.get("type")
+			if ftype != "event":
+				continue
+			payload = frame.get("payload") or {}
+			if active_run_id is not None and payload.get("runId") != active_run_id:
+				continue
+			parsed = parse_event(payload)
+			if parsed is not None:
+				yield parsed
+			# Same lifecycle-phase detection the Node script used.
+			if payload.get("stream") == "lifecycle":
+				phase = (payload.get("data") or {}).get("phase")
+				if phase in ("end", "error"):
+					return
+		raise AgentUnreachableError(
+			"agent turn timed out before lifecycle end",
+			code="turn-timeout",
+		)
+
+	# -- internals --------------------------------------------------------
+
+	@classmethod
+	def _handshake(cls, ws: websocket.WebSocket, creds: ChatDeviceCredentials) -> str | None:
+		"""Receive connect.challenge → sign v3 payload → send connect → expect hello-ok.
+
+		Presents ``auth`` per connect mode and signs the v3 payload's token slot
+		with the SAME token (spike invariant #2 - agent derives the signature
+		token via ``resolveSignatureToken`` = ``auth.token ?? auth.deviceToken ??
+		auth.bootstrapToken``, so the two MUST match or the signature is rejected):
+		  - steady state (device token in hand): ``auth.deviceToken`` = device token
+		    (today's behaviour, unchanged);
+		  - bootstrap / token-fetch (Mechanism A, no device token yet):
+		    ``auth.token`` = the shared gateway token.
+
+		Returns the REISSUED device token from hello-ok's ``auth.deviceToken``
+		when the gateway issued/rotated one (None otherwise). In bootstrap this is
+		how the newly-approved device token reaches the bench; in steady state it
+		is the gateway rotating the stored token. Either way the new token is
+		already durable gateway-side when hello-ok arrives, so the caller MUST
+		adopt it or every following connect fails with "device token mismatch"."""
+		deadline = time.monotonic() + CONNECT_TIMEOUT_SECONDS
+
+		# 1. Wait for the challenge event.
+		nonce: str | None = None
+		while time.monotonic() < deadline:
+			frame = _recv_with_timeout(ws, deadline - time.monotonic())
+			if frame is None:
+				continue
+			if frame.get("type") == "event" and frame.get("event") == "connect.challenge":
+				nonce = (frame.get("payload") or {}).get("nonce")
+				break
+		if not nonce:
+			raise AgentUnreachableError("did not receive connect.challenge before timeout")
+
+		# 2. Sign + send the connect frame.
+		# Build the auth block first, then derive the token slot FROM it in
+		# agent's exact resolveSignatureToken precedence, so the presented
+		# token and the signed token can never drift (invariant #2). Bootstrap
+		# (no device token) presents auth.token=<gateway token>; steady state
+		# presents auth.deviceToken=<device token>.
+		if creds.device_token:
+			auth = {"deviceToken": creds.device_token}
+		else:
+			auth = {"token": creds.bootstrap_token}
+		signing_token = auth.get("token") or auth.get("deviceToken") or auth.get("bootstrapToken") or ""
+
+		signed_at_ms = int(time.time() * 1000)
+		payload = build_payload_v3(
+			device_id=creds.device_id,
+			client_id=_CLIENT_ID,
+			client_mode=_CLIENT_MODE,
+			role=_ROLE,
+			scopes=_REQUESTED_SCOPES,
+			signed_at_ms=signed_at_ms,
+			device_token=signing_token,
+			nonce=nonce,
+			platform=_PLATFORM,
+			device_family="",
+		)
+		signature_b64u = sign_payload(creds.private_key, payload)
+		connect_id = uuid.uuid4().hex
+		connect_params = {
+			"minProtocol": 4,
+			"maxProtocol": 4,
+			"client": {
+				"id": _CLIENT_ID,
+				"version": "0.1.0",
+				"platform": _PLATFORM,
+				"mode": _CLIENT_MODE,
+			},
+			"role": _ROLE,
+			"scopes": _REQUESTED_SCOPES,
+			# The Claude-subscription runtime reports tool calls only on the tool
+			# stream, which the gateway delivers to clients advertising this; the
+			# relay uses those starts to find the live step line's step text.
+			"caps": ["tool-events"],
+			"auth": auth,
+			"device": {
+				"id": creds.device_id,
+				"publicKey": creds.public_key,
+				"signature": signature_b64u,
+				"signedAt": signed_at_ms,
+				"nonce": nonce,
+			},
+		}
+		connect_payload, _ = _build_request_frame("connect", connect_params, req_id=connect_id)
+		ws.send(connect_payload)
+
+		# 3. Wait for the connect response.
+		while time.monotonic() < deadline:
+			frame = _recv_with_timeout(ws, deadline - time.monotonic())
+			if frame is None:
+				continue
+			if _is_response_frame(frame, connect_id):
+				if not frame.get("ok"):
+					err = frame.get("error") or {}
+					details = err.get("details")
+					raise AgentUnreachableError(
+						f"connect rejected: {err.get('code', '?')}: {err.get('message', '')}",
+						code=err.get("code"),
+						details=details if isinstance(details, dict) else None,
+					)
+				# Shape-defensive: a successful connect must NEVER fail on
+				# an unexpected hello-ok payload (pre-change behavior was to
+				# ignore the payload entirely).
+				payload = frame.get("payload")
+				auth = payload.get("auth") if isinstance(payload, dict) else None
+				reissued = auth.get("deviceToken") if isinstance(auth, dict) else None
+				if isinstance(reissued, str) and reissued and reissued != creds.device_token:
+					return reissued
+				return None
+		raise AgentUnreachableError("no connect response before timeout")
+
+	def _send(self, method: str, params: dict) -> str:
+		"""Send a request frame; return the generated request id. Raises
+		``SendNotStarted`` when no byte went out and ``SendUncertain`` (code
+		``ack-timeout``) when the write started and failed."""
+		payload, req_id = _build_request_frame(method, params)
+		self._write_frame(payload, method=method)
+		return req_id
+
+	def _write_frame(
+		self,
+		payload: str,
+		*,
+		wait_s: float = IO_GATE_WAIT_S,
+		write_s: float = IO_WRITE_TIMEOUT_S,
+		not_after: float | None = None,
+		method: str = "frame",
+	) -> None:
+		"""Write one pre-built frame (the relay mux's write seam): wait at most
+		``wait_s`` in total for the send lock and the socket, then at most ``write_s``
+		for the whole frame; ``not_after`` (monotonic) refuses a write that could not
+		finish by then."""
+		self._socket_io().write(
+			payload, lock=self._lock, wait_s=wait_s, write_s=write_s, not_after=not_after, method=method
+		)
+
+	def _request(self, method: str, params: dict, *, timeout_s: float, event_observer=None) -> dict:
+		"""Send a request and wait for the matching response frame.
+
+		Drops out-of-order event frames silently - the caller is RPC-style
+		and doesn't need them. stream_agent_turn handles its own framing."""
+		req_id = self._send(method, params)
+		deadline = time.monotonic() + timeout_s
+		while time.monotonic() < deadline:
+			frame = self._recv(deadline - time.monotonic())
+			if frame is None:
+				continue
+			if event_observer is not None and frame.get("type") == "event":
+				event_observer(frame)
+			if _is_response_frame(frame, req_id):
+				if not frame.get("ok"):
+					err = frame.get("error") or {}
+					details = err.get("details")
+					raise AgentUnreachableError(
+						f"{method} rejected: {err.get('code', '?')}: {err.get('message', '')}",
+						code=err.get("code"),
+						details=details if isinstance(details, dict) else None,
+						rejected_method=method,
+					)
+				return frame
+		# Tagged so callers can tell an AMBIGUOUS outcome from a definite one:
+		# the request frame was already written, so the peer may well have
+		# accepted and acted on it - we just never saw the response. chat.send
+		# uses this to park for snapshot recovery instead of reporting a false
+		# error (see turn_handler). A rejection or a dead socket is definite
+		# and raises without this code.
+		raise AgentUnreachableError(f"{method} timed out", code="ack-timeout")
+
+	def _recv(self, timeout_s: float) -> dict | None:
+		"""Read one frame from the WS, parse JSON, or return None on a soft
+		timeout / non-JSON noise. Raises AgentUnreachableError on hard
+		close so the caller can wrap into an assistant-message error row. A quiet
+		socket is waited on outside the IO gate, so it never delays a write."""
+		return self._socket_io().read(timeout_s)
+
+
+def _recv_with_timeout(ws: websocket.WebSocket, timeout_s: float) -> dict | None:
+	if timeout_s <= 0:
+		return None
+	ws.settimeout(timeout_s)
+	try:
+		raw = ws.recv()
+	except websocket.WebSocketTimeoutException:
+		return None
+	except websocket.WebSocketConnectionClosedException as e:
+		raise AgentUnreachableError(f"agent WS closed: {e}") from e
+	except websocket.WebSocketException as e:
+		raise AgentUnreachableError(f"agent WS error: {e}") from e
+	if not raw:
+		return None
+	try:
+		return json.loads(raw)
+	except json.JSONDecodeError:
+		return None

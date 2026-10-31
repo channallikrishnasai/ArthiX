@@ -1,0 +1,451 @@
+// Global attention signals (NOTIFY-APPROVALS design, Part 1) — the app-level
+// answer to "Jarvis finished / errored / needs you while you're elsewhere".
+// One `jarvis:event` listener attached by AppShell (mounted on every authed
+// route), so signals survive route changes; ChatView keeps handling the
+// on-screen conversation's own events (streaming, cards) and no longer owns
+// any notification.
+//
+// Decision per event, evaluated AT DISPATCH TIME (never cached at mount):
+//   - tab hidden            → browser Notification (opt-in: localStorage
+//     `jarvis-notify` === "1" AND Notification.permission === "granted"),
+//     tag `jarvis-<conversation>` + renotify so bursts alert again.
+//   - visible but elsewhere → in-app toast (bottom-right, see NotifyToaster),
+//     never a browser notification.
+//   - visible on the event's conversation → no attention signal (ChatView renders it).
+// All conversation events, including the open chat, invalidate server-owned
+// sidebar activity. They never infer running/ended state from event delivery (#591).
+// "On screen" = the /c/:id param or, on the chat home, the store's
+// currentConvId (ChatView mirrors its selection there); any non-chat route
+// means no conversation is on screen.
+import { ref } from "vue";
+import { useShellStore } from "@/stores/shell";
+import { session } from "@/data/session";
+import { report as reportError } from "@/lib/errorReporter";
+// The SAME fence ChatView applies to terminals, from the same module, so the two
+// listeners on this socket cannot disagree about what counts as a duplicate.
+import { fenceAccept, fenceReject } from "@/utils/eventFence";
+import { brand } from "@/branding";
+import { macroDoneSignal } from "@/lib/macroRunOutcome";
+
+// ---- toast state (rendered by NotifyToaster.vue) -----------------------------
+const MAX_TOASTS = 3;
+const TOAST_MS = 6000;
+const toasts = ref([]); // [{ id, title, body, onClick }]
+let _seq = 0;
+const _timers = new Map();
+
+export function useToasts() {
+	return toasts;
+}
+
+export function pushToast({ title, body, onClick }) {
+	const id = ++_seq;
+	const next = [
+		...toasts.value,
+		{ id, title: title || brand.agentName, body: body || "", onClick },
+	];
+	// max 3 stacked — drop the oldest (and its timer) instead of growing a pile
+	while (next.length > MAX_TOASTS) {
+		const drop = next.shift();
+		const tm = _timers.get(drop.id);
+		if (tm) clearTimeout(tm);
+		_timers.delete(drop.id);
+	}
+	toasts.value = next;
+	_timers.set(
+		id,
+		setTimeout(() => dismissToast(id), TOAST_MS)
+	);
+	return id;
+}
+
+export function dismissToast(id) {
+	const tm = _timers.get(id);
+	if (tm) {
+		clearTimeout(tm);
+		_timers.delete(id);
+	}
+	toasts.value = toasts.value.filter((t) => t.id !== id);
+}
+
+// ---- helpers -----------------------------------------------------------------
+// The browser-notification opt-in, read fresh per dispatch: a grant/revoke in
+// another tab (or the site settings) takes effect immediately (D13).
+function _notifyAllowed() {
+	try {
+		return (
+			typeof Notification !== "undefined" &&
+			localStorage.getItem("jarvis-notify") === "1" &&
+			Notification.permission === "granted"
+		);
+	} catch (e) {
+		return false;
+	}
+}
+
+function _excerpt(s, n = 120) {
+	const t = String(s || "")
+		.trim()
+		.replace(/\s+/g, " ");
+	return t.length > n ? t.slice(0, n - 1) + "…" : t;
+}
+
+// ---- the listener --------------------------------------------------------------
+// Returns a detach function; AppShell calls attach in onMounted and the
+// detacher in onBeforeUnmount (same socket instance ChatView injects).
+// Outcomes of a background export that the user is waiting for. A retry that queues itself, a
+// pause (it restarts by itself), their own cancel, a quiet expiry and the card's first
+// announcement are not worth a dot. The phone app applies the same rule (pwa/src/lib/exportFeed.js).
+const EXPORT_OUTCOMES = new Set(["ready", "too large", "too slow", "failed"]);
+function exportSignals(p) {
+	return !!p.conversation_id && !p.initial && EXPORT_OUTCOMES.has(p.status);
+}
+
+export function attachGlobalNotifier({ socket, router }) {
+	if (!socket) return () => {};
+	const store = useShellStore();
+
+	const onScreenConv = () => (router.currentRoute.value.meta.chat ? store.currentConvId : null);
+	// The Triggers pane renders its own conversation inline, but /triggers has
+	// meta.chat falsy so onScreenConv() can't see it. The pane persists its
+	// conversation id per user (useStorage writes the raw string); read that
+	// same key so its turns don't dot/toast while the pane is on screen. Only
+	// the Triggers tab mounts the pane — not #activity, not the detail pages.
+	const triggersPaneConv = () => {
+		const r = router.currentRoute.value;
+		if (r.name !== "TriggersPage" || String(r.hash || "").startsWith("#activity")) return null;
+		try {
+			return localStorage.getItem(`jarvis-triggers-conv-${session.user || "anon"}`) || null;
+		} catch (e) {
+			return null;
+		}
+	};
+	const dashboardStoredConv = () => {
+		try {
+			return localStorage.getItem(`jarvis-dash-conv-${session.user || "anon"}`) || null;
+		} catch (e) {
+			return null;
+		}
+	};
+	const dashboardsPaneConv = () => {
+		const r = router.currentRoute.value;
+		if (r.name !== "DashboardsPage" || String(r.hash || "").startsWith("#saved")) return null;
+		return dashboardStoredConv();
+	};
+	const conversationPath = (conv, originPage = "") =>
+		originPage === "dashboards" || (conv && conv === dashboardStoredConv())
+			? { name: "DashboardsPage", query: { conversation: conv } }
+			: conv
+			? "/c/" + conv
+			: "/";
+	const convTitle = (id) => (id && store.conversations.find((c) => c.name === id)?.title) || "";
+	const go = (path) => {
+		try {
+			window.focus();
+		} catch (e) {
+			// Some browsers refuse programmatic focus. Routing still works.
+		}
+		router.push(path);
+	};
+
+	function browserNotify({ title, body, tag, onclick }) {
+		if (!_notifyAllowed()) return;
+		try {
+			const n = new Notification(title, { body, tag, renotify: true });
+			n.onclick = () => {
+				if (onclick) onclick();
+				n.close();
+			};
+		} catch (e) {
+			// page-context Notification unsupported (e.g. Android Chrome) — no-op
+		}
+	}
+
+	// trigger:activity bursts (a bulk save fires one frame per doc) coalesce to
+	// one signal per trigger+status within this window.
+	const trigSignalAt = new Map();
+	const TRIG_SIGNAL_WINDOW_MS = 5000;
+
+	// When each conversation last had a failed turn announced. A macro step that
+	// fails raises run:error for its turn and, a moment later, macro:done for the
+	// run: one failure, and it gets one signal.
+	const runErrorSignalAt = new Map();
+	const MACRO_AFTER_RUN_ERROR_MS = 5000;
+
+	// Conversations seen running a macro (macro:progress / macro:done name them). A
+	// run's chat is not in the chat list, and each of its steps is a turn of its own:
+	// without this every step raised "Reply ready" and an unread dot on a row the
+	// sidebar never shows. The run is announced once, when it ends (macro:done).
+	const macroConvs = new Set();
+	const MACRO_CONVS_MAX = 200;
+	const noteMacroConv = (conv) => {
+		if (!conv || macroConvs.has(conv)) return;
+		macroConvs.add(conv);
+		if (macroConvs.size > MACRO_CONVS_MAX) macroConvs.delete(macroConvs.values().next().value);
+	};
+
+	// Terminal fence, per listener. The server publishes a turn's terminal MORE THAN
+	// ONCE (settlement, then the finalize backstop re-publish), and ChatView has always
+	// deduped it one-shot so its announce + reload fire once. This listener did not, so
+	// every doubled terminal became TWO "Reply ready" toasts for one reply.
+	//
+	// Own state, deliberately NOT shared with ChatView's: both listeners see every
+	// frame, and a shared fence would let whichever ran first accept the terminal and
+	// the other reject it, silently breaking one of the two.
+	const fence = {};
+	store.startConversationActivity();
+	const refreshActivity = () => {
+		if (!document.hidden) store.refreshConversationActivity();
+	};
+	refreshActivity();
+	const activityPoll = setInterval(refreshActivity, 30 * 1000);
+	socket.on("connect", refreshActivity);
+	document.addEventListener("visibilitychange", refreshActivity);
+
+	// hidden → browser notification; visible-but-elsewhere → toast;
+	// visible on the conversation → nothing.
+	function signal({ conv, title, body, tag, open, toastAnywhere = false }) {
+		if (document.hidden) {
+			browserNotify({ title, body, tag, onclick: open });
+		} else if (toastAnywhere || conv !== onScreenConv()) {
+			pushToast({ title, body, onClick: open });
+		}
+	}
+
+	function onEvent(p) {
+		if (p?.kind === "share:changed") {
+			store.loadSharedConversations?.({ refresh: true });
+			return;
+		}
+		if (!p || !p.kind) return;
+		if (p.conversation_id) store.scheduleConversationActivityRefresh();
+		switch (p.kind) {
+			case "run:end":
+			case "run:error": {
+				// One-shot per (run, epoch): a re-published terminal must not signal
+				// twice. Placed before reportError too, so a duplicate error frame is
+				// not reported twice either.
+				if (fenceReject(fence, p, true)) return;
+				fenceAccept(fence, p, true);
+				const conv = p.conversation_id;
+				// A failed turn is the most common error a user faces. Report it
+				// (classified, with the run id) regardless of on-screen state - this
+				// is a socket event, so the global handlers never see it.
+				if (p.kind === "run:error") {
+					reportError({
+						surface: "spa_chat",
+						error_code: p.code || "run_error",
+						error_class: "RunError",
+						message: p.error || "The run failed.",
+						conversation: conv || "",
+						run_id: p.run_id || "",
+					});
+				}
+				if (!conv) return;
+				// A macro step's turn: the run is announced when it ends (macro:done).
+				if (macroConvs.has(conv)) return;
+				// The Triggers pane renders this conversation's turns inline — treat
+				// it like the on-screen chat: no unread dot, no "Reply ready" toast.
+				// A hidden tab still browser-notifies below, same as a hidden chat.
+				const onTriggersPane = conv === triggersPaneConv();
+				const onDashboardsPane = conv === dashboardsPaneConv();
+				const dashboardConversation =
+					p.origin_page === "dashboards" || conv === dashboardStoredConv();
+				if ((onTriggersPane || onDashboardsPane) && !document.hidden) return;
+				if (!onTriggersPane && !dashboardConversation && conv !== onScreenConv()) {
+					// the sidebar unread dot — the in-app "multiple chats" signal
+					store.markUnread(conv);
+					// keep the row's title/order honest (debounced reload)
+					store.applyRemoteNew();
+				}
+				const title = convTitle(conv) || brand.agentName;
+				// A stop is the user's own click, seconds ago - the dot is useful, a
+				// notification saying "Reply ready" for the reply they just killed is not.
+				if (p.stopped) return;
+				if (p.kind === "run:error") runErrorSignalAt.set(conv, Date.now());
+				const body =
+					p.kind === "run:error"
+						? `${brand.agentName} hit an error in ${convTitle(conv) || "your chat"}`
+						: _excerpt(p.preview) || "Reply ready";
+				signal({
+					conv,
+					title,
+					body,
+					tag: "jarvis-" + conv,
+					open: () =>
+						go(conversationPath(conv, dashboardConversation ? "dashboards" : "")),
+				});
+				return;
+			}
+			case "action:pending": {
+				// keyed `conversation` (may be "" when the server can't resolve one —
+				// it still reached THIS user's socket, so fall back to the active chat)
+				const conv = p.conversation || store.currentConvId || null;
+				const tool = p.tool ? String(p.tool).replace(/^jarvis__/, "") : "";
+				if (conv === dashboardsPaneConv() && !document.hidden) return;
+				signal({
+					conv,
+					title: convTitle(conv) || brand.agentName,
+					body: `${brand.agentName} needs your confirmation` + (tool ? ": " + tool : ""),
+					tag: "jarvis-" + (conv || "confirm"),
+					open: () => go(conversationPath(conv, p.origin_page || "")),
+				});
+				return;
+			}
+			case "approval:new": {
+				// bump the badge NOW, then re-read the truth: a held write that joins an
+				// existing row, or a re-asked question, doesn't add one
+				store.approvalsCount = (store.approvalsCount || 0) + 1;
+				store.refreshApprovalsCount();
+				const conv = p.conversation_id || null;
+				const dashboardApproval = p.origin_page === "dashboards";
+				if (dashboardApproval && conv === dashboardsPaneConv() && !document.hidden) return;
+				signal({
+					conv: null,
+					toastAnywhere: true, // waiting-on-you is worth a toast even on-conversation
+					title: `${brand.agentName} is waiting on you`,
+					body: dashboardApproval
+						? _excerpt(p.question) || "A dashboard question needs your answer."
+						: _excerpt(p.question) ||
+						  "A question needs your answer on the Approval Board.",
+					tag: "jarvis-" + (conv || "approvals"),
+					open: () =>
+						go(
+							dashboardApproval ? conversationPath(conv, "dashboards") : "/approvals"
+						),
+				});
+				return;
+			}
+			case "action:settled":
+				// a card or held write was decided somewhere: the badge may have dropped
+				store.refreshApprovalsCount();
+				return;
+			case "review:pending": {
+				// a skill or wiki promotion is waiting on this reviewer: re-read the
+				// sidebar Skills badge now (server truth, not +1; both queues share
+				// this kind). Badge only, no toast.
+				store.refreshReviewCount();
+				return;
+			}
+			case "trigger:activity": {
+				// A trigger run the user would want to hear about: Failed / Blocked
+				// always; Success only for LLM actions (the "warn me when…" case —
+				// Script successes and Skipped rows are routine noise). action_type
+				// may be absent on older frames: then only Failed/Blocked signal.
+				const status = p.status;
+				const wanted =
+					status === "Failed" ||
+					status === "Blocked" ||
+					(status === "Success" && p.action_type === "LLM");
+				if (!wanted) return;
+				// coalesce a burst into one signal per trigger+status
+				const key = (p.trigger || "") + "|" + status;
+				const now = Date.now();
+				if (now - (trigSignalAt.get(key) || 0) < TRIG_SIGNAL_WINDOW_MS) return;
+				trigSignalAt.set(key, now);
+				const label = p.trigger_label || p.trigger || "";
+				const what = label ? `Trigger "${label}"` : "A trigger";
+				const title =
+					status === "Failed"
+						? "Trigger failed"
+						: status === "Blocked"
+						? "Trigger blocked a save"
+						: "Trigger fired";
+				const body =
+					status === "Failed"
+						? `${what} hit an error. Open the activity log for details.`
+						: status === "Blocked"
+						? `${what} blocked a document from saving.`
+						: `${what} ran. See the activity log for what it found.`;
+				const open = () => go("/triggers#activity");
+				// like conversation:new, hand-rolled: signal() would swallow a
+				// conv-less toast on non-chat routes (null === onScreenConv()).
+				// The Activity tab itself live-refreshes — no toast on top of it.
+				const r = router.currentRoute.value;
+				const onActivityTab =
+					r.name === "TriggersPage" && String(r.hash || "").startsWith("#activity");
+				if (document.hidden) {
+					browserNotify({ title, body, tag: "jarvis-trigger-activity", onclick: open });
+				} else if (!onActivityTab) {
+					pushToast({ title, body, onClick: open });
+				}
+				return;
+			}
+			case "macro:progress":
+				noteMacroConv(p.conversation);
+				return;
+			case "macro:done": {
+				// A macro run that finished or FAILED. The run's chat is not in the chat
+				// list (no unread dot to set), so this is the one signal it ends with.
+				const conv = p.conversation || null;
+				noteMacroConv(conv);
+				const sig = macroDoneSignal(p);
+				if (!sig) return;
+				if (
+					conv &&
+					Date.now() - (runErrorSignalAt.get(conv) || 0) < MACRO_AFTER_RUN_ERROR_MS
+				)
+					return; // the step's own failure was just announced
+				signal({
+					conv,
+					// A run with no conversation left has no screen that shows it.
+					toastAnywhere: !conv,
+					title: sig.title,
+					body: _excerpt(sig.body, 160),
+					tag: "jarvis-" + (conv || "macro"),
+					open: () => go(conv ? "/c/" + conv : "/macros/runs"),
+				});
+				return;
+			}
+			case "conversation:new": {
+				const conv = p.conversation_id;
+				if (!conv) return;
+				// off the chat routes ChatView isn't mounted to refresh the sidebar
+				// list — do it here (debounced; harmless double when both run)
+				if (!router.currentRoute.value.meta.chat) store.applyRemoteNew();
+				const title = p.title || `Message from ${brand.agentName}`;
+				const body =
+					_excerpt(p.preview) ||
+					`${brand.agentName} started a new conversation with you.`;
+				const open = () => go("/c/" + conv);
+				if (document.hidden) {
+					browserNotify({ title, body, tag: "jarvis-" + conv, onclick: open });
+				} else if (!router.currentRoute.value.meta.chat) {
+					// ChatView's own proactive toast covers visible chat routes
+					pushToast({ title, body, onClick: open });
+				}
+				return;
+			}
+			case "export:changed": {
+				// A background export reached an outcome. Like import:finished this owns only
+				// the off-screen unread dot, with no toast or browser notification; ChatView
+				// refreshes the card itself when the conversation is on screen.
+				const conv = p.conversation_id;
+				if (exportSignals(p) && conv !== onScreenConv()) store.markUnread(conv);
+				return;
+			}
+			case "import:finished": {
+				// Slice B: a background CSV import finished; the bench already
+				// posted the "✓ ..." completion message into the conversation and
+				// committed it durably. ChatView (this same socket, a separate
+				// listener) re-reads the transcript live when that conversation is
+				// on screen — this listener owns only the off-screen unread dot,
+				// and deliberately calls markUnread DIRECTLY, bypassing signal()/
+				// browserNotify: no push toast/browser notification for this
+				// event, this wave.
+				const conv = p.conversation_id;
+				if (conv && conv !== onScreenConv()) store.markUnread(conv);
+				return;
+			}
+		}
+	}
+
+	socket.on("jarvis:event", onEvent);
+	return () => {
+		socket.off("jarvis:event", onEvent);
+		socket.off("connect", refreshActivity);
+		document.removeEventListener("visibilitychange", refreshActivity);
+		clearInterval(activityPoll);
+		store.stopConversationActivity();
+	};
+}

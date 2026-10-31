@@ -1,0 +1,570 @@
+"""WP-1d — the ONE critical settlement transaction (Relay Pump).
+
+Pump-invoked at a terminal frame (``on_terminal``), plus the reconcile path
+(settlement-owed turns recovered from the row, R-12) and the cancel sweep. This
+is D3 Race 3 realised against the ownership table (WP-D / D1):
+
+  * the final assistant-text PROJECTION + the ``terminal_observed -> finalizing |
+    errored | cancelled`` state advance + the conversation-slot release, ALL in
+    ONE epoch+version-fenced transaction (nothing blocking — no WS poll, R-4);
+  * the turn's REQUIRED ``Jarvis Turn Effect`` rows inserted in that SAME txn so
+    finalize has a CLOSED, force-done-bounded owed-enrichment set (OAR-9);
+  * a 0-rows LOSS routes through the ONE shared ``lease_lost_exit`` (a takeover
+    re-stamped the epoch — D3 S3; the uncommitted S1 message write rolls back);
+  * AFTER the winning commit, the AUTHORITATIVE fenced terminal realtime event
+    (``run:end`` with ``enrichment_pending`` for a success/abort, SUX-7; or a
+    ``run:error`` carrying today's Message.error classification for an error,
+    SUX-11), then ``enqueue_finalize`` — enrichment can never block the next turn
+    or convert a success to an error.
+
+This module is wired as the pump's ``invoke_settlement`` seam (pump.PumpDeps);
+``jarvis.chat.pump._default_invoke_settlement`` lazily delegates here so the
+DEFAULT deps settle correctly in production, and tests inject it directly.
+
+HARD INVARIANTS (restated): every turn mutation goes through ``turn_state``; the
+settlement txn contains NOTHING blocking; realtime publishes are fenced and fire
+only after the winning commit; usage is NOT in this txn (it is a finalize effect
+with a (turn_id) idempotency guard, R-4).
+"""
+
+from __future__ import annotations
+
+import json
+
+import frappe
+
+from jarvis.chat import egress_rules, txn
+from jarvis.chat import turn_state as ts
+
+TURN = "Jarvis Chat Turn"
+MSG = "Jarvis Chat Message"
+CONV = "Jarvis Conversation"
+
+# The owed-enrichment set fixed at settlement (OAR-9), expressed over the ONE
+# canonical vocabulary ``turn_state.EFFECT_NAMES`` (never a local literal — the
+# insert seam rejects any name outside it). A relay:final success owes the FULL
+# vocabulary; an errored/cancelled terminal owes the macro-advance + telemetry
+# hooks and the File Box sheet seal (there is no rich output/title/usage to
+# enrich, and its reply is already terminal — finalize NEVER un-settles it).
+# BOTH sets owe terminal_publish (CDX-12 / R-5): the idempotent terminal
+# re-publish backstop so a lost settlement terminal (run:end / run:error) is
+# redelivered off the durable row, on success AND error.
+# If an effect is ever added that a SUCCESS does not owe, this stops being the whole
+# canon and must become an explicit subset of ``ts.EFFECT_NAMES``.
+FINAL_EFFECTS = ts.EFFECT_NAMES
+TERMINAL_EFFECTS = ("terminal_publish", "file_box_sheet_seal", "macro_advance", "telemetry_flush")
+SHARED_FINAL_EFFECTS = ("terminal_publish", "enrich_cards", "chat_asks", "usage", "telemetry_flush")
+SHARED_TERMINAL_EFFECTS = ("terminal_publish", "usage", "telemetry_flush")
+
+
+def invoke_settlement(
+	run_id: str,
+	*,
+	relay_target_id: str,
+	epoch: int,
+	version: int,
+	terminal_kind: str,
+	terminal_payload: dict | None,
+	assistant_message: str | None,
+	owner: str | None,
+	conversation: str,
+	deps,
+) -> None:
+	"""Settle one turn at its terminal (D3 Race 3). Epoch+version-fenced; a stale
+	pump's CAS affects 0 rows and exits via ``lease_lost_exit`` (which rolls back
+	the uncommitted S1 message write). On a win, publishes the authoritative fenced
+	terminal event AFTER commit, then enqueues finalize. Never blocks."""
+	from jarvis.chat.collaboration import is_collaborative
+
+	shared_binding = None
+	if is_collaborative(conversation):
+		from jarvis.chat import collaboration as c
+		from jarvis.chat.collaboration_bindings import require_settlement
+		from jarvis.chat.collaboration_turn import binding_for_run
+
+		shared_binding = binding_for_run(run_id)
+		if not shared_binding or shared_binding.conversation != conversation:
+			c._deny()
+		require_settlement(shared_binding, run_id, "assistant")
+		owner = shared_binding.actor
+
+	def project():
+		"""The settlement transaction: projection + state advance + effects, committed as
+		one. Returns what the post-commit half needs, or None when there is nothing to
+		publish (already settled, or a benign loss rolled back). Replayed whole by
+		``txn.replay_on_conflict`` if it loses a snapshot race: the reply row it projects
+		into is also written by the tool's web request (the file card), and a precious
+		terminal that raised here would be quarantined for a whole pump hop."""
+		if shared_binding:
+			frappe.db.get_value(CONV, conversation, "name", for_update=True)
+			bound = frappe.db.get_value(
+				TURN,
+				run_id,
+				[
+					"conversation",
+					"actor",
+					"collaboration_binding",
+					"assistant_message",
+					"collaboration_send_started_at",
+				],
+				as_dict=True,
+				for_update=True,
+			)
+			if (
+				not bound
+				or not bound.collaboration_send_started_at
+				or (bound.conversation, bound.actor, bound.collaboration_binding)
+				!= (conversation, shared_binding.actor, shared_binding.name)
+				or (assistant_message and assistant_message != bound.assistant_message)
+			):
+				c._deny()
+			reply = (
+				frappe.db.get_value(
+					MSG,
+					bound.assistant_message,
+					["conversation", "actor", "collaboration_binding", "collaboration_run_id", "role"],
+					as_dict=True,
+					for_update=True,
+				)
+				if bound.assistant_message
+				else None
+			)
+			if not reply or (
+				reply.conversation,
+				reply.actor,
+				reply.collaboration_binding,
+				reply.collaboration_run_id,
+				reply.role,
+			) != (conversation, shared_binding.actor, shared_binding.name, run_id, "assistant"):
+				c._deny()
+		row = ts.read_turn(run_id)
+		if row is None:
+			return
+		# Already settled (finalizing/done/errored/cancelled): a replayed/duplicate
+		# terminal. Idempotent no-op (the CAS below would also 0-row, but skip the work).
+		if row["state"] not in ("terminal_observed",):
+			return
+		v = int(row["version"])
+		kind = row.get("terminal_kind") or terminal_kind
+		am = assistant_message or row.get("assistant_message")
+		aborted = bool(row.get("cancel_requested")) and _is_aborted_payload(
+			row.get("terminal_kind"), terminal_payload
+		)
+		if shared_binding and am and (aborted or kind == "relay:error"):
+			from jarvis.chat.scrub import scrub_for_share
+
+			# Shared deltas stay out of storage until a complete payload can be
+			# scrubbed. Error/stop terminals can still contain a useful answer.
+			text = scrub_for_share(_final_text(terminal_payload))
+			if text:
+				ts._run_cas(
+					f"UPDATE `tab{MSG}` SET content=%(text)s WHERE name=%(m)s", {"text": text, "m": am}
+				)
+
+		if aborted:
+			# Clean-stop terminal (D2 #19). The stop is a FLAG, not prose: keep whatever
+			# streamed; the SPA renders the marker from `stopped` (matches legacy).
+			if am:
+				ts._run_cas(f"UPDATE `tab{MSG}` SET stopped=1, streaming=0 WHERE name=%(m)s", {"m": am})
+			won = ts.settle_cancelled(run_id, v, epoch)
+			if won:
+				ts.insert_required_effects(
+					run_id, SHARED_TERMINAL_EFFECTS if shared_binding else TERMINAL_EFFECTS
+				)
+			pub_kind, pub_extra = "run:end", {"stopped": True}
+		elif kind == "relay:error":
+			err = _error_text(terminal_payload)
+			if shared_binding:
+				from jarvis.chat.scrub import scrub_for_share
+
+				err = scrub_for_share(err)
+			# Mark errored WITHOUT overwriting the streamed content (matches legacy
+			# _mark_errored: streaming=0 + error, content preserved). SUX-11: the code
+			# classification travels on the realtime event below.
+			if am:
+				ts._run_cas(
+					f"UPDATE `tab{MSG}` SET streaming=0, error=%(e)s WHERE name=%(m)s",
+					{"e": err[:1000], "m": am},
+				)
+			won = ts.settle_errored(run_id, v, epoch, error=err)
+			if won:
+				ts.insert_required_effects(
+					run_id, SHARED_TERMINAL_EFFECTS if shared_binding else TERMINAL_EFFECTS
+				)
+			pub_kind, pub_extra = "run:error", {"error": err, "code": _classify(err)}
+		else:
+			final_text = _final_text(terminal_payload)
+			if shared_binding:
+				from jarvis.chat.scrub import scrub_for_share
+
+				final_text = scrub_for_share(final_text)
+			# A media/marker-only reply strips to empty text; force the content overwrite
+			# whenever ANY MEDIA: marker was stripped, so the raw streamed batcher tail
+			# (which could carry the marker) can never survive into stored content. Coerce
+			# the payload: this boundary can receive a JSON string on the reconcile path.
+			_tp = _coerce_payload(terminal_payload)
+			marker_stripped = isinstance(_tp, dict) and bool(_tp.get("marker_stripped"))
+			# S1 final projection (final text beats the batcher tail); always clear
+			# streaming even when the terminal carried no text (matches legacy).
+			if am:
+				if final_text or marker_stripped:
+					ts._run_cas(
+						f"UPDATE `tab{MSG}` SET content=%(c)s, streaming=0 WHERE name=%(m)s",
+						{"c": final_text or "", "m": am},
+					)
+				else:
+					ts._run_cas(f"UPDATE `tab{MSG}` SET streaming=0 WHERE name=%(m)s", {"m": am})
+			won = ts.settle_finalizing(
+				run_id, v, epoch, required_effects=SHARED_FINAL_EFFECTS if shared_binding else FINAL_EFFECTS
+			)
+			# SUX-6: was_recovered tells the client a VISIBLE replacement is legitimate
+			# (the answer changed via snapshot recovery); on the normal path it is 0 and
+			# the client skips re-rendering an identical terminal.
+			pub_kind, pub_extra = (
+				"run:end",
+				{
+					"enrichment_pending": True,
+					"was_recovered": bool(frappe.db.get_value(TURN, run_id, "was_recovered")),
+				},
+			)
+
+		# F4: stamp the REAL reply duration where the UI reads it (see _stamp_reply_duration).
+		# Runs inside the fenced txn: on a win it commits atomically with the projection; on a
+		# 0-rows loss it rolls back with the message write below.
+		if won and am:
+			_stamp_reply_duration(am, run_id)
+			_stamp_steps(am, run_id)
+
+		if not won:
+			# OARF-3 / §10.11: a 0-rows settlement CAS is NOT unconditionally a lease
+			# loss. Re-read the row's epoch to disambiguate:
+			#   * epoch NO LONGER matches -> a takeover re-stamped us; route through the
+			#     ONE shared lease-loss exit (rollback undoes the uncommitted S1 message
+			#     write, stops writing/publishing; the pump's on_terminal wrapper converts
+			#     the LeaseLostExit to its shared exit).
+			#   * epoch INTACT + version drifted -> a legitimate concurrent actor moved
+			#     the row (e.g. the watchdog marked a stuck terminal_observed turn
+			#     recovering in the TOCTOU window between read_turn and this CAS). That is
+			#     an ordinary optimistic-concurrency loss, NOT a lease incident; rolling
+			#     back the S1 write and returning lets reconcile/watchdog own it; killing
+			#     the whole hop here would turn a benign drift into an availability
+			#     incident (every turn on the shard stalls up to LEASE_TTL_S).
+			if _epoch_lost(run_id, epoch):
+				ts.lease_lost_exit(run_id)
+			else:
+				frappe.db.rollback()
+			return
+
+		if pub_kind == "run:error":
+			# A dead chat sign-in ends here as a relay:error: remember it in the same commit that
+			# settles the turn (idempotent, so a replay of this unit is harmless). Never raises.
+			from jarvis import subscription_health
+
+			subscription_health.note_turn_error(pub_extra["error"], pub_extra["code"])
+
+		frappe.db.commit()  # nosemgrep: frappe-manual-commit -- release turn slot
+		return row, am, pub_kind, pub_extra
+
+	settled = txn.replay_on_conflict(project, label=f"settlement {run_id}")
+	if settled is None:
+		return
+	row, am, pub_kind, pub_extra = settled
+
+	# jarvis#1425 review (live e2e2, 2026-09-27): a Relay Pump reply's terminal
+	# write lands here, not in turn_handler.py's legacy exit - e2e2's actual
+	# replies run through the pump, so turn_handler._maybe_apply_llm_switch's
+	# own poke never fires for them. This ONE call site is shared by every pump
+	# terminal that reaches invoke_settlement (a normal terminal, an aborted
+	# stop, a reconcile-owed settle, and the recovery-settlement siblings), so
+	# poking here covers all of them at once, right after the commit that just
+	# released this slot. Cheap (one is_active() redis GET first) and never
+	# raises - a reply must never fail because this poke did.
+	from jarvis.chat import llm_switch
+
+	llm_switch.apply_if_active(source="settlement.invoke_settlement")
+
+	# The maintained per-conversation turn counter that drives the once-per-session
+	# feedback popup. Runs BEFORE the terminal publish so the client's
+	# ``session_feedback_status`` call on ``run:end`` already sees this turn counted.
+	_bump_turn_count(conversation, run_id)
+
+	# S5 — authoritative fenced terminal event, ONLY after the winning commit. CDX-3:
+	# the terminal carries pump_epoch so the client permanently blocks any later
+	# lower-epoch straggler (a stale pump's late delta / run:start) for this turn. CDX-12:
+	# it also carries a STABLE terminal identity (run_id + epoch + a terminal seq = the
+	# durable watermark at the terminal) so the client dedupes a repeat equal-epoch
+	# terminal (the finalize backstop re-publish) one-shot — no repeated announcement/reload.
+	if owner:
+		# C2: ride any live parked confirmation card for this conversation on the
+		# fenced, backstopped terminal, so a card whose best-effort action:pending
+		# push was missed re-surfaces at turn-end without a manual reload.
+		if not shared_binding:
+			pub_extra = _extra_with_pending(pub_extra, owner, conversation)
+		ts.publish_fenced(
+			owner,
+			pub_kind,
+			conversation_id=conversation,
+			run_id=run_id,
+			event_seq=int(row.get("last_event_seq") or 0),
+			message_id=am,
+			pump_epoch=epoch,
+			relay_target_id=relay_target_id,
+			**pub_extra,
+		)
+
+	# S6 — enqueue enrichment (idempotent per (turn, effect_name); force-done at 3).
+	deps.enqueue_finalize(run_id, relay_target_id)
+	if shared_binding:
+		from jarvis.chat.collaboration_ownership import wake_queued
+
+		wake_queued(relay_target_id)
+
+	# Last, so its read takes no snapshot before the steps above. The helper never raises;
+	# the try is for the import. A run:error pub_extra carries "error" and "code".
+	if pub_kind == "run:error":
+		try:
+			from jarvis.chat.turn_handler import _note_empty_reply
+
+			_note_empty_reply(run_id, conversation, pub_extra["error"], pub_extra["code"])
+		except Exception:
+			pass
+
+
+def _is_hidden_turn(run_id: str) -> bool:
+	"""True when this turn's SEED user message is hidden from the transcript - an
+	internal system prompt rather than something a human typed.
+
+	``chat.api.enqueue_continuation`` is the ONLY producer that passes
+	``hidden=True`` today (checked: macro steps and app-learning prompts call
+	``_enqueue_turn`` WITHOUT it - those conversations are excluded by
+	``agent_initiated`` instead). Every human Apply/Confirm click dispatches such a
+	continuation, and it rides this same pump path, so without this guard ONE user
+	action (send a message that stages a write, then click Apply) counts as TWO
+	turns and the popup fires at roughly half the intended engagement depth.
+
+	``hidden`` lives on the seed Message, not on the Turn row, so this is a
+	two-table read - one statement via ``frappe.qb`` with an explicit join (the
+	multi-table read rule), two primary-key seeks. A turn with no seed message (a
+	recovered / synthesised terminal) yields no row and counts as a normal turn."""
+	t = frappe.qb.DocType(TURN)
+	m = frappe.qb.DocType(MSG)
+	rows = (
+		frappe.qb.from_(t).inner_join(m).on(m.name == t.seed_message).select(m.hidden).where(t.name == run_id)
+	).run()
+	return bool(rows and rows[0][0])
+
+
+def _bump_turn_count(conversation: str, run_id: str) -> None:
+	"""Advance ``Jarvis Conversation.turn_count`` by one for a settled turn.
+
+	O(1) indexed single-row UPDATE, never a ``COUNT(*)`` over ``tabJarvis Chat
+	Message``: this is the highest-frequency path the session-feedback feature
+	touches (every assistant reply, every conversation, fleet-wide), so the
+	popup's trigger check must be a plain integer read, not a scan. Same shape as
+	``greeting.increment_new_chat_count`` - an ATOMIC ``col = col + 1`` rather
+	than a read-modify-write, so two settlements racing on one conversation
+	(reconcile + terminal) can never lose an increment.
+
+	Three exclusions, so the counter measures HUMAN engagement and nothing else
+	(spec: File Box and agent-initiated conversations are excluded from turn
+	counting):
+	  * ``file_box=0`` - an unattended drop, never a chat session;
+	  * ``agent_initiated=0`` - a macro / merge / app-learning / scheduled-audit /
+	    proactive / act-on-a-finding run log the user did not open;
+	  * ``_is_hidden_turn`` - a confirmation continuation, which is part of the
+	    user's PREVIOUS action, not a new turn.
+	The first two ride the same indexed lookup and cost nothing extra; a 0-row
+	update is the intended outcome there, so the rowcount is not consulted. The
+	third is checked FIRST so an excluded turn skips the UPDATE and its commit
+	entirely.
+
+	DELIBERATELY its OWN transaction, AFTER the settlement commit above, NOT
+	inside the fenced settlement txn. ``Jarvis Conversation`` is rank 2 in the
+	canonical lock order (control -> conversation -> turn -> message, OAR-6) and
+	the settlement txn already holds turn (rank 3) and message (rank 4) row locks;
+	taking a conversation lock there would invert against
+	``admission.accept_or_queue`` (shard -> conversation -> turn) and could
+	deadlock a concurrent send. The codebase already draws this line explicitly:
+	``admission._sweep_age_out`` and the user-cancel path both COMMIT their turn
+	CAS before calling ``_write_cancel_marker``, which takes the conversation
+	lock. This txn holds exactly one row lock and never waits while holding
+	another, so it cannot be part of a cycle.
+
+	Cost of the split: a crash between the settlement commit and this bump
+	undercounts one turn (a re-settle returns early on the already-advanced
+	state). Acceptable - the counter is an advisory engagement signal, and the
+	popup simply fires one turn later.
+
+	NEVER raises: a failed bump must not cost the turn its terminal publish or
+	its finalize enqueue, and must not leave an open txn/row lock across the
+	realtime publish that follows."""
+	try:
+		if _is_hidden_turn(run_id):
+			return
+		frappe.db.sql(
+			"""UPDATE `tabJarvis Conversation` SET turn_count = turn_count + 1
+			WHERE name=%(c)s AND file_box=0 AND agent_initiated=0""",
+			{"c": conversation},
+		)
+		# Own short transaction (see above): commit immediately so the conversation
+		# row lock is released before the publish, and is never held across it.
+		frappe.db.commit()
+	except Exception:
+		# Guarded like turn_state.lease_lost_exit's: on a connection-level fault the
+		# rollback itself can raise, and "never raises" has to hold literally.
+		try:
+			frappe.db.rollback()
+		except Exception:
+			pass
+		# Same guard on the error log: it INSERTs an Error Log row over the very
+		# connection that just failed, so during a DB outage it raises too, and an
+		# escape here would cost the turn its run:end publish and finalize enqueue.
+		try:
+			frappe.log_error(title="settlement.bump_turn_count", message=frappe.get_traceback())
+		except Exception:
+			pass
+
+
+def _extra_with_pending(extra: dict, owner: str | None, conversation: str) -> dict:
+	"""C2 self-heal: fold any live parked confirmation card(s) for ``conversation``
+	into a terminal event's ``extra`` payload under ``pending``, so a card whose
+	best-effort ``action:pending`` push was missed re-surfaces on the (fenced,
+	backstopped) ``run:end`` without a manual reload. Returns a NEW dict when a card
+	is present (never mutates the caller's) and the input unchanged - no ``pending``
+	key - in the common no-card case (one owner-index read). Shared by settlement's
+	authoritative publish and finalize's re-publish backstop so they can't diverge."""
+	if not owner:
+		return extra
+	from jarvis.chat import pending_confirm
+
+	pending = pending_confirm.list_items_for_owner(owner, conversation)
+	if not pending:
+		return extra
+	return {**extra, "pending": pending}
+
+
+# --------------------------------------------------------------------------- #
+# terminal-payload helpers (mirror pump.py's so the two agree on shape)
+# --------------------------------------------------------------------------- #
+
+
+def _stamp_reply_duration(assistant_message: str, run_id: str) -> None:
+	"""CDX-20 / F4 — the persisted turn-duration fix, on ONE durable baseline shared with the
+	live timer. The pump projects the assistant row via raw SQL (``ts._run_cas``) and the
+	streaming batcher writes deltas with ``update_modified=False``, so the row's ``modified``
+	never advances past the placeholder insert — a reload's duration read 0.0s. The FIX stamps a
+	dedicated ``reply_duration_ms`` metric (NOT a rewrite of Frappe's ``creation`` audit field —
+	CDX-20) computed on the SAME boundary the live timer uses:
+
+	    run:start (the pump's ``dispatching_at`` — stamped at ready->dispatching, IMMEDIATELY
+	    before ``run:start`` is published in _dispatch_one) -> settlement (now, the terminal).
+
+	The SPA's live timer runs from the ``run:start`` event to the ``run:end`` event; the reload
+	path reads THIS ``reply_duration_ms`` (ChatView.elapsedOf), so both anchor on run:start↔
+	settlement and agree within network tolerance. ``dispatching_at`` is used — NOT
+	``first_event_at`` (which the round-3 code used): first_event_at is written only at the
+	chat.send ACK (dispatching->streaming), i.e. AFTER run:start, so it undercounts the span the
+	user watched tick. ``modified`` IS bumped to now — honest (the row is genuinely finalized in
+	this txn), which also fixes the assistant row's hover timestamp — but ``creation`` is left
+	untouched. Runs inside the fenced settlement txn (no commit here); a stale-pump loss rolls
+	it back with the rest."""
+	start = frappe.db.get_value(TURN, run_id, "dispatching_at")
+	if not start:
+		# A degenerate turn with no dispatch stamp — still bump modified (finalized now) but
+		# record no duration; the UI then falls back to its legacy modified-creation read.
+		ts._run_cas(
+			f"UPDATE `tab{MSG}` SET modified=%(now)s WHERE name=%(m)s",
+			{"now": frappe.utils.now(), "m": assistant_message},
+		)
+		return
+	duration_ms = int(max(0, frappe.utils.time_diff_in_seconds(frappe.utils.now(), start) * 1000))
+	ts._run_cas(
+		f"UPDATE `tab{MSG}` SET reply_duration_ms=%(d)s, modified=%(now)s WHERE name=%(m)s",
+		{"d": duration_ms, "now": frappe.utils.now(), "m": assistant_message},
+	)
+
+
+def _stamp_steps(assistant_message: str, run_id: str) -> None:
+	"""Save the steps the user watched with the reply, so the folded head can show them
+	later (after the turn and after a reload). They are the pump's published lines, already
+	redacted, read from its 1 h cache. Best-effort: a cache miss writes nothing. A plain write,
+	so the replay-on-conflict txn can run it again; ``modified`` is left to the duration stamp."""
+	from jarvis.chat import pump
+
+	try:
+		lines = pump._read_run_step_lines(run_id)
+	except Exception:
+		return
+	if not lines:
+		return
+	try:
+		ts._run_cas(
+			f"UPDATE `tab{MSG}` SET steps=%(s)s WHERE name=%(m)s",
+			{"s": frappe.as_json(lines[: pump.RUN_STEP_LINES_MAX]), "m": assistant_message},
+		)
+	except Exception as e:
+		# Code running ahead of its migrate (no ``steps`` column yet): the reply
+		# settles without its steps rather than failing. Anything else, a snapshot
+		# race above all, must still reach txn.replay_on_conflict.
+		if not frappe.db.is_missing_column(e):
+			raise
+
+
+def _epoch_lost(run_id: str, epoch: int) -> bool:
+	"""OARF-3 / §10.11: True iff the row's ``pump_epoch`` no longer matches this
+	settlement's epoch — the real lease-loss signal that distinguishes a takeover
+	(kill the hop) from a benign concurrent-actor version drift (an ordinary
+	optimistic-concurrency loss the hop must survive)."""
+	e = frappe.db.get_value(TURN, run_id, "pump_epoch")
+	return e is None or int(e) != epoch
+
+
+def _coerce_payload(payload):
+	if isinstance(payload, str):
+		try:
+			return json.loads(payload)
+		except Exception:
+			return {"text": payload}
+	return payload
+
+
+def _final_text(payload) -> str | None:
+	# Redact at this terminal DB-write boundary too, symmetric with _error_text.
+	# Idempotent: every current producer passes an already-redacted value, so this
+	# is a no-op today and only bites a future path that fed settlement raw content.
+	payload = _coerce_payload(payload)
+	if isinstance(payload, dict):
+		return egress_rules.redact(payload.get("text"))
+	return None
+
+
+def _error_text(payload) -> str:
+	# Redact the brand family at this terminal boundary too (idempotent - the
+	# upstream relay already redacts - but keeps the DB error column + publish clean
+	# regardless of who calls settlement).
+	payload = _coerce_payload(payload)
+	if isinstance(payload, dict):
+		return egress_rules.redact(
+			payload.get("error") or payload.get("state") or "The run ended with an error."
+		)
+	return "The run ended with an error."
+
+
+def _is_aborted_payload(terminal_kind, payload) -> bool:
+	payload = _coerce_payload(payload)
+	if isinstance(payload, dict):
+		if payload.get("aborted") is True:
+			return True
+		if payload.get("state") == "aborted":
+			return True
+	return False
+
+
+def _classify(err_text: str) -> str:
+	"""Preserve today's Message.error headline classification (SUX-11)."""
+	try:
+		from jarvis.chat.turn_handler import _classify_error
+
+		return _classify_error(err_text)
+	except Exception:
+		return "internal"

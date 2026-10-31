@@ -1,0 +1,947 @@
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+// readiness.js reaches the backend through @/api.js, whose real module pulls in
+// frappe-ui. The factory form of vi.mock keeps that module out of the graph
+// entirely, so these tests exercise the verdict logic and nothing else.
+const isReadyForChat = vi.fn();
+vi.mock("@/api.js", () => ({ isReadyForChat: (...a) => isReadyForChat(...a) }));
+
+const {
+	readinessDetailOf,
+	needsLlmConnection,
+	needsOnboarding,
+	regateOnboarding,
+	regateOnRouteChange,
+	forgetReady,
+	replacedBanner,
+	copyBanner,
+	copyNoticeOf,
+	subscriptionExpiredBanner,
+	hasReconnectIntent,
+	landingStep,
+	isLlmApplying,
+	isLlmApplyStuck,
+	isContainerUnavailable,
+	needsNetworkCheck,
+	hasNetworkIntent,
+	NETWORK_INTENT_URL,
+	RECONNECT_INTENT_URL,
+} = await import("./readiness.js");
+
+// The verdict is memoized for the page load, so every case has to start clean.
+beforeEach(() => {
+	forgetReady();
+	isReadyForChat.mockReset();
+});
+
+const verdict = (v) => isReadyForChat.mockResolvedValue(v);
+
+/**
+ * ChatView renders the not-ready banners as ONE v-else-if chain, so at most one
+ * of these two accessors may answer for any given reason. When both answered for
+ * "llm_credentials" the generic, button-less "Chat may not work yet" banner won
+ * the chain and the actionable "No AI connected" banner (the only route back to
+ * the AI models pane) could never appear. These tests pin the split so a future
+ * edit cannot silently shadow it again.
+ */
+describe("readiness verdict ownership", () => {
+	it("gives llm_credentials to needsLlmConnection ALONE", async () => {
+		// is_ready_for_chat sends no `detail` for this reason (jarvis/account.py):
+		// there is nothing to quote, only a state to name.
+		verdict({ ready: false, reason: "llm_credentials" });
+		expect(await needsLlmConnection()).toBe(true);
+		expect(await readinessDetailOf()).toBe("");
+	});
+
+	it("still hands llm_credentials to needsLlmConnection when a detail leaks in", async () => {
+		// Defensive: readinessDetailOf must key off the REASON, not the presence of
+		// a detail string, or a future backend that starts sending one for this
+		// reason would re-create the shadowing bug.
+		verdict({ ready: false, reason: "llm_credentials", detail: "Anything at all." });
+		expect(await needsLlmConnection()).toBe(true);
+		expect(await readinessDetailOf()).toBe("");
+	});
+
+	it("keeps container_provisioning on the generic banner, not the AI one", async () => {
+		verdict({
+			ready: false,
+			reason: "container_provisioning",
+			detail: "Your OpenAI account has reached its usage limit.",
+		});
+		expect(await readinessDetailOf()).toBe("Your OpenAI account has reached its usage limit.");
+		expect(await needsLlmConnection()).toBe(false);
+	});
+
+	it("shows authority_repair_required on the generic banner, never a CTA one", async () => {
+		// review plan 04 P0-6: the safe blocked state must surface admin's own
+		// reassurance and NOTHING that offers payment/reconnect. It rides the same
+		// generic detail banner as container_provisioning, and needsLlmConnection
+		// (the only accessor with a CTA) must stay silent for it.
+		verdict({
+			ready: false,
+			reason: "authority_repair_required",
+			detail: "Your payment is safe — please don't retry payment.",
+		});
+		expect(await readinessDetailOf()).toBe(
+			"Your payment is safe — please don't retry payment."
+		);
+		expect(await needsLlmConnection()).toBe(false);
+	});
+
+	it("jarvis#885: surfaces container_unavailable's detail sentence, never the AI CTA", async () => {
+		// A dead container is not a missing LLM credential, so needsLlmConnection
+		// must stay silent for it (its dedicated banner is isContainerUnavailable(),
+		// checked separately by ChatView - see the exhaustive test below for the
+		// mutual-exclusion pin).
+		verdict({
+			ready: false,
+			reason: "container_unavailable",
+			detail: "Your workspace container stopped responding.",
+		});
+		expect(await readinessDetailOf()).toBe("Your workspace container stopped responding.");
+		expect(await needsLlmConnection()).toBe(false);
+	});
+
+	it("leaves subscription_suspended to its own Renew banner", async () => {
+		verdict({ ready: false, reason: "subscription_suspended", detail: "Renew to continue." });
+		expect(await readinessDetailOf()).toBe("");
+		expect(await needsLlmConnection()).toBe(false);
+	});
+
+	it("shows neither banner on a ready workspace", async () => {
+		verdict({ ready: true, reason: null });
+		expect(await readinessDetailOf()).toBe("");
+		expect(await needsLlmConnection()).toBe(false);
+	});
+
+	it("shows neither banner when the check throws (fail-open)", async () => {
+		isReadyForChat.mockRejectedValue(new Error("admin unreachable"));
+		expect(await readinessDetailOf()).toBe("");
+		expect(await needsLlmConnection()).toBe(false);
+	});
+
+	// The exhaustive form of the rule above: whatever account.py answers, the two
+	// accessors must never BOTH claim the same verdict.
+	it("never lets both accessors claim one reason", async () => {
+		const reasons = [
+			"signup",
+			"llm_credentials",
+			"llm_pool_provisioning",
+			"llm_provisioning",
+			"container_provisioning",
+			"authority_repair_required",
+			"container_unavailable",
+			"subscription_suspended",
+			"llm_applying",
+			"llm_apply_stuck",
+			null,
+		];
+		for (const reason of reasons) {
+			forgetReady();
+			verdict({ ready: false, reason, detail: "d" });
+			const both = !!(await readinessDetailOf()) && (await needsLlmConnection());
+			expect(both, `reason ${reason} is claimed by both accessors`).toBe(false);
+		}
+	});
+});
+
+/**
+ * jarvis#691: AppShell reads needsOnboarding() exactly ONCE at mount (it never
+ * remounts across a client-side navigation) and holds the answer in a local
+ * ref, so nothing re-derives the gate on its own when a connect succeeds while
+ * still on /onboarding - the customer lands on Chat with the poster still up
+ * over a workspace the backend now calls ready. regateOnboarding(current) is
+ * what AppShell calls on every route change to close that gap; these pin its
+ * two behaviours directly, without mounting the (heavy) shell component.
+ */
+describe("llm_rejected still gates (jarvis#757, round-1 review of #760)", () => {
+	it("keeps a never-connected customer on the onboarding gate", async () => {
+		// llm_rejected fires in the SAME structural position as the two
+		// provisioning reasons, a first sync that never succeeded, and it only
+		// ever REPLACES one of them. Adding the reason without listing it in
+		// NOT_ONBOARDED_REASONS silently reopened the gate, dropping a customer
+		// whose connection was never accepted into a chat shell that cannot
+		// answer them.
+		forgetReady();
+		verdict({ ready: false, reason: "llm_rejected", detail: "provider + model required" });
+		expect(await needsOnboarding()).toBe(true);
+	});
+});
+
+/**
+ * jarvis#825: a stuck apply must be its own honest, retryable in-app state - NOT
+ * the full-screen setup gate (that was the pre-#825 bug: an established customer
+ * whose apply hung got silently bounced to the wizard), and NOT the two ownership
+ * accessors above (it gets its own banner + Retry). These pin all three.
+ */
+describe("llm_apply_stuck (jarvis#825)", () => {
+	it("isLlmApplyStuck answers ONLY for its own reason", async () => {
+		verdict({ ready: false, reason: "llm_apply_stuck" });
+		expect(await isLlmApplyStuck()).toBe(true);
+		forgetReady();
+		verdict({ ready: false, reason: "llm_applying" });
+		expect(await isLlmApplyStuck()).toBe(false);
+		forgetReady();
+		verdict({ ready: true, reason: null });
+		expect(await isLlmApplyStuck()).toBe(false);
+	});
+
+	it("isLlmApplying and isLlmApplyStuck are mutually exclusive", async () => {
+		verdict({ ready: false, reason: "llm_apply_stuck" });
+		expect(await isLlmApplying()).toBe(false);
+		forgetReady();
+		verdict({ ready: false, reason: "llm_applying" });
+		expect(await isLlmApplyStuck()).toBe(false);
+	});
+
+	it("does NOT trip the full-screen onboarding gate", async () => {
+		// The whole point of #825: the workspace WAS established, so it keeps its
+		// chat + history and gets a banner, never the setup poster. If this ever
+		// returns true, llm_apply_stuck was wrongly added to NOT_ONBOARDED_REASONS.
+		verdict({ ready: false, reason: "llm_apply_stuck" });
+		expect(await needsOnboarding()).toBe(false);
+	});
+});
+
+/**
+ * jarvis#885: a dead/unhealthy container must be its own honest, outage-framed
+ * banner - NOT the generic "Chat may not work yet" title (readinessDetailOf
+ * still supplies the detail SENTENCE, but isContainerUnavailable is what picks
+ * the banner), and NOT the full-screen onboarding gate (an established
+ * workspace whose container later died keeps its chat + history).
+ */
+describe("container_unavailable (jarvis#885)", () => {
+	it("isContainerUnavailable answers ONLY for its own reason", async () => {
+		verdict({ ready: false, reason: "container_unavailable" });
+		expect(await isContainerUnavailable()).toBe(true);
+		forgetReady();
+		verdict({ ready: false, reason: "container_provisioning" });
+		expect(await isContainerUnavailable()).toBe(false);
+		forgetReady();
+		verdict({ ready: true, reason: null });
+		expect(await isContainerUnavailable()).toBe(false);
+	});
+
+	it("never claims the llm_credentials CTA banner", async () => {
+		verdict({ ready: false, reason: "container_unavailable" });
+		expect(await needsLlmConnection()).toBe(false);
+	});
+
+	it("does NOT trip the full-screen onboarding gate", async () => {
+		// The workspace WAS established (it had a running container that then
+		// died), so it keeps its chat + history and gets a banner, never the
+		// setup poster.
+		verdict({ ready: false, reason: "container_unavailable" });
+		expect(await needsOnboarding()).toBe(false);
+	});
+});
+
+describe("regateOnboarding (jarvis#691 stale-gate re-check)", () => {
+	it("re-confirms with the backend when the caller is currently gated", async () => {
+		// The memo held a stale "never onboarded" verdict (captured before an
+		// in-app connect landed); forgetReady() (as navigateToChat() already
+		// calls before it changes the route) clears it, so the re-check below
+		// sees the fresh, ready answer.
+		verdict({ ready: false, reason: "llm_setup" });
+		expect(await needsOnboarding()).toBe(true);
+		forgetReady();
+		verdict({ ready: true, reason: null });
+		expect(await regateOnboarding(true)).toBe(false);
+	});
+
+	it("does not re-check when the caller is not currently gated", async () => {
+		// A false verdict never needs re-confirming (an established workspace's
+		// later degrade is a soft llm_credentials banner, never a return to a
+		// NOT_ONBOARDED_REASONS gate) - regateOnboarding must not spend a
+		// round-trip on every ordinary navigation.
+		isReadyForChat.mockRejectedValue(new Error("must not be called"));
+		expect(await regateOnboarding(false)).toBe(false);
+		expect(await regateOnboarding(null)).toBe(null);
+		expect(isReadyForChat).not.toHaveBeenCalled();
+	});
+
+	it("stays gated when the fresh check still says not onboarded", async () => {
+		verdict({ ready: false, reason: "signup" });
+		expect(await regateOnboarding(true)).toBe(true);
+	});
+});
+
+// A promise the test controls the settlement of, so a call to isReadyForChat
+// can be held open exactly as long as a scenario needs.
+function deferred() {
+	let resolve;
+	const promise = new Promise((r) => {
+		resolve = r;
+	});
+	return { promise, resolve };
+}
+
+/**
+ * round-4 review F3/F4: AppShell.vue's route-change handler used to write
+ * `gatedOnboarding` directly and without any sequencing guard. Both defects
+ * are about TIMING, not the eventual value, so these pin the sequence of
+ * states over the course of the async call rather than only its final result
+ * (per the review's own instruction: "tests that pin the timing, not just the
+ * end state").
+ */
+describe("regateOnRouteChange (jarvis#691 round-4 review F3/F4)", () => {
+	it("F3: never writes the stale gated value while the re-check is in flight (no flash)", async () => {
+		const d = deferred();
+		isReadyForChat.mockReturnValue(d.promise);
+		const gated = { value: true };
+		const regating = { value: false };
+
+		const p = regateOnRouteChange(gated, regating);
+		// Synchronously, before the network call resolves: the caller (AppShell's
+		// showGate) reads gated.value === true - if that gets rendered
+		// unconditionally, THAT is the flash this fix exists to close. The hold
+		// flag going up in the SAME microtask is what lets a caller avoid it.
+		await Promise.resolve(); // let regateOnRouteChange reach its first await
+		expect(regating.value).toBe(true);
+		expect(gated.value).toBe(true); // untouched - neither cleared nor rewritten yet
+
+		d.resolve({ ready: true, reason: null });
+		await p;
+
+		expect(regating.value).toBe(false);
+		expect(gated.value).toBe(false); // the fresh verdict, written only now
+	});
+
+	it("F3: a workspace still not onboarded also clears the hold once confirmed, poster stays up honestly", async () => {
+		const d = deferred();
+		isReadyForChat.mockReturnValue(d.promise);
+		const gated = { value: true };
+		const regating = { value: false };
+
+		const p = regateOnRouteChange(gated, regating);
+		await Promise.resolve();
+		expect(regating.value).toBe(true);
+
+		d.resolve({ ready: false, reason: "signup" });
+		await p;
+
+		expect(regating.value).toBe(false);
+		expect(gated.value).toBe(true); // confirmed still gated - the poster is correct here
+	});
+
+	it("is a fast no-op (no hold, no network call) when not currently gated", async () => {
+		isReadyForChat.mockRejectedValue(new Error("must not be called"));
+		const gated = { value: false };
+		const regating = { value: false };
+
+		await regateOnRouteChange(gated, regating);
+
+		expect(regating.value).toBe(false);
+		expect(gated.value).toBe(false);
+		expect(isReadyForChat).not.toHaveBeenCalled();
+	});
+
+	it("F4: only the most recently ISSUED check may write, regardless of resolution order", async () => {
+		const first = deferred();
+		const second = deferred();
+		isReadyForChat.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+		const gated = { value: true };
+		const regating = { value: false };
+
+		// Two route changes in quick succession while still gated: both issue
+		// before either resolves. checkReady() memoizes for the page load, so a
+		// SECOND genuinely independent read needs its own forgetReady() in
+		// between - exactly what happens between two real back-to-back
+		// connect-driven navigations, each of which calls forgetReady() itself
+		// before changing the route (see navigateToChat in OnboardingView.vue).
+		const p1 = regateOnRouteChange(gated, regating);
+		await Promise.resolve();
+		forgetReady();
+		const p2 = regateOnRouteChange(gated, regating);
+		await Promise.resolve();
+
+		// Resolve OUT OF ISSUE ORDER: the second (newer) call answers first, with
+		// the fresh "ready" verdict; the first (now-stale) call answers after,
+		// with a verdict that would wrongly re-gate a ready workspace if it were
+		// allowed to write.
+		second.resolve({ ready: true, reason: null });
+		await p2;
+		expect(gated.value).toBe(false); // the newer call's answer landed
+
+		first.resolve({ ready: false, reason: "signup" });
+		await p1;
+		// The stale, earlier-issued call must NOT have overwritten the fresher
+		// answer, even though it resolved second (last write does not win here -
+		// issue order does).
+		expect(gated.value).toBe(false);
+	});
+});
+
+/**
+ * The banner stack in ChatView is a v-else-if chain, so its SOURCE ORDER is the
+ * behaviour. Mounting ChatView to assert this is not viable (it is the largest
+ * component in the app and boots sockets, so this reads the template instead,
+ * the same trick dashboardOpen.test.js already uses on this file).
+ */
+describe("ChatView banner chain order", () => {
+	const HERE = path.dirname(fileURLToPath(import.meta.url));
+	const chatSrc = fs.readFileSync(path.join(HERE, "..", "views", "ChatView.vue"), "utf8");
+
+	it("tests the specific No-AI banner before the generic not-ready one", () => {
+		const specific = chatSrc.indexOf('v-else-if="noAiConnected"');
+		const generic = chatSrc.indexOf('v-else-if="notReadyNotice"');
+		expect(specific, "ChatView must still render the noAiConnected banner").not.toBe(-1);
+		expect(generic, "ChatView must still render the notReadyNotice banner").not.toBe(-1);
+		// Specific before generic: the No-AI banner carries the "Connect a model"
+		// call to action, so a generic banner ahead of it in the chain leaves a
+		// disconnected customer with no discoverable way back to the AI models pane.
+		expect(specific).toBeLessThan(generic);
+	});
+
+	it("orders the stuck-apply banner AFTER the still-converging one (jarvis#825)", () => {
+		const applying = chatSrc.indexOf('v-else-if="llmApplying"');
+		const stuck = chatSrc.indexOf('v-else-if="llmApplyStuck"');
+		expect(applying, "ChatView must still render the llmApplying banner").not.toBe(-1);
+		expect(stuck, "ChatView must render the llmApplyStuck banner").not.toBe(-1);
+		// llmApplying is the LIVE, still-converging window; llmApplyStuck is the
+		// aged-out one. Applying must win the chain while it is true, so the honest
+		// "didn't finish" banner only shows once the soft window has genuinely
+		// lapsed - never over a retry that just flipped the reason back to applying.
+		expect(applying).toBeLessThan(stuck);
+	});
+
+	it("orders the soft workersWarnNotice banner AFTER suspendedNotice (billing takes precedence)", () => {
+		const suspended = chatSrc.indexOf('v-else-if="suspendedNotice"');
+		const warn = chatSrc.indexOf('v-else-if="workersWarnNotice"');
+		expect(suspended, "ChatView must still render the suspendedNotice banner").not.toBe(-1);
+		expect(warn, "ChatView must render the workersWarnNotice banner").not.toBe(-1);
+		expect(suspended).toBeLessThan(warn);
+	});
+});
+
+/**
+ * Upgrade maintenance hold (Stream E). Same source-read technique as the suites
+ * above (mounting ChatView is not viable). Pins the load-bearing wiring facts:
+ * the hold banner outranks the release nudge, the hold HARD-blocks the composer
+ * (canSend gated on holdActive + :disabled on the Composer), and the send-gate
+ * branch mirrors the server's policy order without a reload.
+ */
+describe("maintenance hold banner + send gate", () => {
+	const HERE = path.dirname(fileURLToPath(import.meta.url));
+	const chatSrc = fs.readFileSync(path.join(HERE, "..", "views", "ChatView.vue"), "utf8");
+
+	it("renders the hold banner before (above) the release-nudge update banner", () => {
+		const hold = chatSrc.indexOf('v-if="holdActive"');
+		const update = chatSrc.indexOf('v-if="updateBannerVisible"');
+		expect(hold, "ChatView must render the maintenance hold banner").not.toBe(-1);
+		expect(update, "ChatView must still render the update banner").not.toBe(-1);
+		// The hold is the more urgent state; the two must never stack (holdActive is
+		// also in hasUrgentAlert, which suppresses updateBannerVisible).
+		expect(hold).toBeLessThan(update);
+	});
+
+	it("suppresses the update banner while a hold is active (holdActive in hasUrgentAlert)", () => {
+		const start = chatSrc.indexOf("const hasUrgentAlert = computed(");
+		expect(start, "ChatView must still define hasUrgentAlert").not.toBe(-1);
+		const end = chatSrc.indexOf(");", start);
+		expect(chatSrc.slice(start, end)).toContain("holdActive.value");
+	});
+
+	it("HARD-blocks: gates canSend on holdActive (Send dead during a hold)", () => {
+		// Reverses the earlier soft-block (composer-stays-enabled + soft refusal). The operator
+		// asked for a hard block, so Send is disabled during a hold (belt-and-suspenders with the
+		// :disabled binding below, which also blocks Enter / voice / programmatic sends).
+		const start = chatSrc.indexOf("const canSend = computed(");
+		expect(start, "ChatView must still define canSend").not.toBe(-1);
+		const end = chatSrc.indexOf("\n);", start);
+		expect(chatSrc.slice(start, end)).toContain("!holdActive.value");
+	});
+
+	it("HARD-blocks: disables the Composer during maintenance or bootstrap (greys the box + blocks typing)", () => {
+		const c = chatSrc.indexOf("<Composer");
+		expect(c, "ChatView must render the Composer").not.toBe(-1);
+		const end = chatSrc.indexOf(">", c);
+		expect(chatSrc.slice(c, end)).toContain(':disabled="holdActive || booting"');
+	});
+
+	it("orders the send-gate maintenance branch between release-update and workspace-resetting", () => {
+		// Searched from send()'s start so retry()'s own maintenance branch (earlier
+		// in the file) doesn't shadow these positions.
+		const sendStart = chatSrc.indexOf("async function send(");
+		expect(sendStart, "ChatView must still define send()").not.toBe(-1);
+		const rel = chatSrc.indexOf('r.reason === "release_update_required"', sendStart);
+		const maint = chatSrc.indexOf('r.reason === "maintenance"', sendStart);
+		const reset = chatSrc.indexOf('r.reason === "workspace_resetting"', sendStart);
+		expect(rel).not.toBe(-1);
+		expect(maint, "send() must handle the maintenance reason").not.toBe(-1);
+		expect(reset).not.toBe(-1);
+		// Mirrors jarvis.chat.policy.validate_can_send: release_update_required ->
+		// maintenance -> workspace_resetting.
+		expect(rel).toBeLessThan(maint);
+		expect(maint).toBeLessThan(reset);
+	});
+
+	it("raises the hold (no reload) in the send-gate maintenance branch", () => {
+		const sendStart = chatSrc.indexOf("async function send(");
+		const maint = chatSrc.indexOf('r.reason === "maintenance"', sendStart);
+		const reset = chatSrc.indexOf('r.reason === "workspace_resetting"', sendStart);
+		const branch = chatSrc.slice(maint, reset);
+		// Self-heal via raiseHold + recheck, NOT a page reload (a hold is transient,
+		// unlike release_update_required which reloads onto the full-page gate).
+		expect(branch).toContain("raiseHold");
+		expect(branch).not.toContain("window.location.reload");
+	});
+});
+
+/**
+ * The hard "no workers" block is gone: RQ's worker registry can read zero
+ * while every worker is alive (a worker hash that expired during a heartbeat
+ * gap comes back without its queues), so the server never refuses a send for
+ * it and the SPA must carry no branch for it. Source-pinned like the suites
+ * around it (mounting ChatView is not viable here).
+ */
+describe("no hard workers block", () => {
+	const HERE = path.dirname(fileURLToPath(import.meta.url));
+	const chatSrc = fs.readFileSync(path.join(HERE, "..", "views", "ChatView.vue"), "utf8");
+
+	it("carries no insufficient_workers branch in retry() or send()", () => {
+		expect(chatSrc).not.toContain('"insufficient_workers"');
+	});
+
+	it("renders no blocking workers banner", () => {
+		expect(chatSrc).not.toContain('v-else-if="workersNotice"');
+		expect(chatSrc).not.toContain("WORKERS_BLOCKED_MSG");
+	});
+
+	it("does not read a worker_blocked field from the readiness poll", () => {
+		expect(chatSrc).not.toContain("worker_blocked");
+	});
+});
+
+/**
+ * Soft, non-blocking worker warning: is_ready_for_chat's worker_warning fires
+ * for degraded/under-provisioned workers. Same source-proximity technique as
+ * the suites above (mounting ChatView is not viable here either).
+ */
+describe("workersWarnNotice self-heal (round 2 mainchat warning)", () => {
+	const HERE = path.dirname(fileURLToPath(import.meta.url));
+	const chatSrc = fs.readFileSync(path.join(HERE, "..", "views", "ChatView.vue"), "utf8");
+
+	it("seeds workersWarnNotice from the boot readiness poll's worker_warning field", () => {
+		const idx = chatSrc.indexOf("r && r.worker_warning");
+		expect(idx, "the boot checkReady().then() block must read r.worker_warning").not.toBe(-1);
+		expect(chatSrc.slice(Math.max(0, idx - 40), idx)).toContain(
+			"workersWarnShown.value = !!("
+		);
+		// The text follows the brand: built from the live brand, never a copy made at setup.
+		const start = chatSrc.indexOf("const workersWarnNotice = computed(");
+		expect(start, "workersWarnNotice must be computed from workersWarnShown").not.toBe(-1);
+		expect(chatSrc.slice(start, start + 160)).toContain(
+			"workerWarningMessage(brand.agentName)"
+		);
+	});
+
+	it("clears workersWarnNotice on the next successful retry", () => {
+		const fnStart = chatSrc.indexOf("async function retry(messageId)");
+		const fnEnd = chatSrc.indexOf("\nasync function send(", fnStart);
+		expect(fnStart, "ChatView must still define retry()").not.toBe(-1);
+		expect(fnEnd, "ChatView must still define send() after retry()").not.toBe(-1);
+		const body = chatSrc.slice(fnStart, fnEnd);
+		const idx = body.indexOf("workersWarnShown.value = false");
+		expect(idx, "retry() must clear workersWarnNotice on a successful response").not.toBe(-1);
+		// Only after the server answered, gated on a genuinely accepted retry.
+		const awaitIdx = body.indexOf("await api.retryMessage(messageId)");
+		expect(idx).toBeGreaterThan(awaitIdx);
+		expect(body.slice(Math.max(0, idx - 120), idx)).toContain("r.ok !== false");
+	});
+
+	it("also clears workersWarnNotice on the next successful send (mirrors retry())", () => {
+		const first = chatSrc.indexOf("workersWarnShown.value = false");
+		const second = chatSrc.indexOf("workersWarnShown.value = false", first + 1);
+		expect(
+			second,
+			"send() must also clear workersWarnNotice on a successful response"
+		).not.toBe(-1);
+		// Gated on a genuinely accepted send, same as retry() above.
+		expect(chatSrc.slice(Math.max(0, second - 120), second)).toContain("r.ok !== false");
+	});
+
+	it("never gates canSend on workersWarnNotice (composer must stay enabled - heads-up only)", () => {
+		const start = chatSrc.indexOf("const canSend = computed(");
+		expect(start, "ChatView must still define canSend").not.toBe(-1);
+		const end = chatSrc.indexOf("\n);", start);
+		expect(chatSrc.slice(start, end)).not.toContain("workersWarnNotice");
+		expect(chatSrc.slice(start, end)).not.toContain("workersWarnShown");
+	});
+});
+
+describe("replaced-site banner", () => {
+	it("names the site the account moved to", () => {
+		const b = replacedBanner({ replaced: true, moved_to: "https://jarvis-2.example.com/" });
+		expect(b.message).toContain("jarvis-2.example.com");
+		expect(b.message).not.toContain("https://");
+		expect(b.action).toBeTruthy();
+	});
+
+	it("still explains itself without a destination", () => {
+		expect(replacedBanner({ replaced: true }).message).toContain("another site");
+	});
+
+	it("stays silent when nothing moved", () => {
+		expect(replacedBanner({})).toBeNull();
+		expect(replacedBanner(null)).toBeNull();
+		expect(replacedBanner({ replaced: false })).toBeNull();
+	});
+});
+
+describe("copied-site banner", () => {
+	it("says the site is a copy and names the original", () => {
+		const b = copyBanner({ paired_site: "erp.example.com" });
+		expect(b.tone).toBe("warning");
+		expect(b.title).toBe("This site is a copy");
+		expect(b.message).toBe(
+			"This site is a copy of erp.example.com. Jarvis is turned off here. Contact support to use Jarvis on this site."
+		);
+	});
+
+	it("names another site when the pin is empty", () => {
+		expect(copyBanner({ paired_site: "" }).message).toBe(
+			"This site is a copy of another site. Jarvis is turned off here. Contact support to use Jarvis on this site."
+		);
+	});
+
+	it("stays silent without a notice", () => {
+		expect(copyBanner(null)).toBeNull();
+	});
+
+	it("reads the notice off the readiness verdict", async () => {
+		verdict({
+			ready: false,
+			reason: "site_is_copy",
+			copy_notice: { paired_site: "erp.example.com" },
+		});
+		expect(await copyNoticeOf()).toEqual({ paired_site: "erp.example.com" });
+		forgetReady();
+		verdict({ ready: false, reason: "signup" });
+		expect(await copyNoticeOf()).toBeNull();
+	});
+});
+
+describe("reconnect intent", () => {
+	it("recognises only the flag the banner actually sends", () => {
+		expect(hasReconnectIntent(new URL(RECONNECT_INTENT_URL, "http://x").search)).toBe(true);
+		expect(hasReconnectIntent("?reconnect=1&foo=bar")).toBe(true);
+		expect(hasReconnectIntent("?reconnect=0")).toBe(false);
+		expect(hasReconnectIntent("?other=1")).toBe(false);
+	});
+
+	it("treats missing or unparseable input as no intent", () => {
+		expect(hasReconnectIntent("")).toBe(false);
+		expect(hasReconnectIntent(null)).toBe(false);
+		expect(hasReconnectIntent(undefined)).toBe(false);
+	});
+});
+
+describe("landing step", () => {
+	it("sends a reconnect intent to the step that carries the offer", () => {
+		expect(landingStep({ intent: true, resumedStep: "pay", terminal: false })).toBe("details");
+		expect(landingStep({ intent: true, resumedStep: "intro", terminal: false })).toBe(
+			"details"
+		);
+	});
+
+	it("leaves the resumed step alone without the intent", () => {
+		expect(landingStep({ intent: false, resumedStep: "pay", terminal: false })).toBe("pay");
+		expect(landingStep({ intent: false, resumedStep: "intro", terminal: false })).toBe(
+			"intro"
+		);
+	});
+
+	it("never drags a paid or provisioning signup into reconnect", () => {
+		expect(landingStep({ intent: true, resumedStep: "connect", terminal: true })).toBe(
+			"connect"
+		);
+	});
+});
+
+/**
+ * Slice 3b review wave: the release-nudge banner's visibility is two computeds in
+ * ChatView.vue - hasUrgentAlert (what the soft banner yields to) and
+ * updateBannerVisible (when it renders). Mounting ChatView is not viable (see the
+ * source-slice suites above), so these slice the two computeds and pin the
+ * decision text, the same technique those suites already use on this file.
+ */
+describe("update-banner visibility rules (Slice 3b review wave)", () => {
+	const HERE = path.dirname(fileURLToPath(import.meta.url));
+	const chatSrc = fs.readFileSync(path.join(HERE, "..", "views", "ChatView.vue"), "utf8");
+
+	function sliceComputed(name) {
+		const start = chatSrc.indexOf(`const ${name} = computed(`);
+		expect(start, `ChatView must still define ${name}`).not.toBe(-1);
+		const end = chatSrc.indexOf(");", start);
+		expect(end, `${name} must be a closed computed(...)`).not.toBe(-1);
+		return chatSrc.slice(start, end);
+	}
+
+	it("hasUrgentAlert INCLUDES llmApplyStuck (chat genuinely can't answer, so the nudge yields)", () => {
+		// llmApplyStuck's own ref comment says chat "genuinely cannot answer" - an
+		// aged-out apply, not a still-converging one - so the update banner must
+		// yield to it. Dropping it (the pre-fix state) stacked a "please update"
+		// nudge over a chat that couldn't answer at all.
+		expect(sliceComputed("hasUrgentAlert")).toContain("llmApplyStuck");
+	});
+
+	it("hasUrgentAlert does NOT yield to the soft heads-ups (workersWarnNotice/llmApplying)", () => {
+		// Those keep chat working, so the update banner should show over them - a
+		// bench low on workers, or a routine mid-apply, would otherwise NEVER
+		// surface the nudge. ("llmApplyStuck" is present but does not match the
+		// "llmApplying" substring.)
+		const body = sliceComputed("hasUrgentAlert");
+		expect(body).not.toContain("workersWarnNotice");
+		expect(body).not.toContain("llmApplying");
+	});
+
+	it("updateBannerVisible no longer suppresses on showWelcome (banner shows over the welcome screen)", () => {
+		// The highest-traffic surface. Re-adding showWelcome here would hide the
+		// nudge from the users most likely to see only the welcome screen.
+		expect(sliceComputed("updateBannerVisible")).not.toContain("showWelcome");
+	});
+});
+
+// Mounting the 16k-line ChatView for one guard is not worth the harness, so these pin
+// the boot gate the same source-level way as the maintenance gate above. The runtime
+// behaviour (composer released after a stalled or failed boot call) is covered by
+// tests/e2e/chat-bootstrap.spec.js.
+describe("bootstrap send gate", () => {
+	const HERE = path.dirname(fileURLToPath(import.meta.url));
+	const chatSrc = fs.readFileSync(path.join(HERE, "..", "views", "ChatView.vue"), "utf8");
+	const mountStart = chatSrc.indexOf("onMounted(async () => {");
+	const mountEnd = chatSrc.indexOf("\n});", mountStart);
+	const mountSrc = chatSrc.slice(mountStart, mountEnd);
+
+	it("send() bails while booting before any side effect, independent of the disabled composer", () => {
+		const start = chatSrc.indexOf("async function send(textArg, resendAck) {");
+		expect(start, "ChatView must still define send()").not.toBe(-1);
+		const firstStatement = chatSrc
+			.slice(start, chatSrc.indexOf("dismissFeedback();", start))
+			.split("\n")
+			.filter((line) => line.trim() && !line.trim().startsWith("//"));
+		expect(firstStatement[1].trim()).toBe("if (booting.value) return;");
+	});
+
+	it("clears booting in ONE finally whose try spans the settings await", () => {
+		expect(mountStart, "ChatView must still mount via onMounted(async ...)").not.toBe(-1);
+		const tryAt = mountSrc.indexOf("\n\ttry {");
+		const uiAwait = mountSrc.indexOf("await bootStep(uiP)");
+		const reset = mountSrc.indexOf("\t} finally {\n\t\tbooting.value = false;");
+		expect(tryAt).not.toBe(-1);
+		expect(uiAwait).toBeGreaterThan(tryAt);
+		expect(reset).toBeGreaterThan(uiAwait);
+		expect(chatSrc.match(/booting\.value = false/g)).toHaveLength(1);
+	});
+
+	it("bounds every boot network await with the deadline", () => {
+		const bootBody = mountSrc.slice(0, mountSrc.indexOf("booting.value = false"));
+		for (const unbounded of [
+			"await uiP",
+			"await convsP",
+			"await loadConversation(",
+			"await newChat()",
+		]) {
+			expect(bootBody, `boot must not ${unbounded} without bootStep`).not.toContain(
+				unbounded
+			);
+		}
+		expect(bootBody).toContain("await bootStep(convsP)");
+		expect(bootBody).toContain("await bootStep(loadConversation(first))");
+	});
+});
+
+describe("subscriptionExpiredBanner skipped copy", () => {
+	const entry = {
+		upstream: "anthropic",
+		label: "Anthropic",
+		account_ref: "A",
+		fallback: "OpenAI",
+	};
+
+	it("says Auto skips it when the entry is skipped", () => {
+		expect(subscriptionExpiredBanner([{ ...entry, skipped: true }], true).message).toBe(
+			"Auto skips it until you reconnect."
+		);
+	});
+
+	it("keeps the Auto uses line when it is not skipped", () => {
+		expect(subscriptionExpiredBanner([{ ...entry, skipped: false }], true).message).toBe(
+			"Auto uses OpenAI until you reconnect."
+		);
+	});
+});
+
+describe("subscriptionExpiredBanner copy (spec section 3)", () => {
+	const openai = { upstream: "openai", label: "OpenAI", account_ref: "A1", fallback: "" };
+
+	it("returns null when nothing is expired", () => {
+		expect(subscriptionExpiredBanner([], true)).toBeNull();
+		expect(subscriptionExpiredBanner(undefined, false)).toBeNull();
+	});
+
+	it("an admin whose chats fail is told what happens and offered Reconnect", () => {
+		expect(subscriptionExpiredBanner([openai], true)).toEqual({
+			title: "OpenAI sign-in expired",
+			message: "Chats that need it will fail until it is reconnected.",
+			upstream: "openai",
+			accountRef: "A1",
+			showReconnect: true,
+		});
+	});
+
+	it("an admin whose other model still answers is told which one", () => {
+		const b = subscriptionExpiredBanner([{ ...openai, fallback: "Anthropic" }], true);
+		expect(b.message).toBe("Auto uses Anthropic until you reconnect.");
+		expect(b.showReconnect).toBe(true);
+	});
+
+	it("a member is sent to their admin and gets no action", () => {
+		const b = subscriptionExpiredBanner([{ upstream: "xai", label: "xAI Grok" }], false);
+		expect(b.title).toBe("xAI Grok sign-in expired");
+		expect(b.message).toBe("Ask your workspace admin to reconnect it.");
+		expect(b.showReconnect).toBe(false);
+		expect(b.accountRef).toBe("");
+	});
+
+	it("uses no em dashes", () => {
+		const b = subscriptionExpiredBanner([{ ...openai, fallback: "Anthropic" }], true);
+		expect(JSON.stringify(b)).not.toContain("\u2014");
+	});
+});
+
+describe("ChatView subscription-expired wiring", () => {
+	const HERE = path.dirname(fileURLToPath(import.meta.url));
+	const chatSrc = fs.readFileSync(path.join(HERE, "..", "views", "ChatView.vue"), "utf8");
+	const at = (needle) => {
+		const i = chatSrc.indexOf(needle);
+		expect(i, `ChatView must contain ${needle}`).not.toBe(-1);
+		return i;
+	};
+
+	it("orders the composer banners: billing, then the expired sign-in, then the existing chain unchanged", () => {
+		const order = [
+			'v-else-if="suspendedNotice"',
+			'v-else-if="subscriptionExpired"',
+			'v-else-if="workersWarnNotice"',
+			'v-else-if="noAiConnected"',
+			'v-else-if="containerUnavailable"',
+			'v-else-if="notReadyNotice"',
+			'v-else-if="llmApplying"',
+			'v-else-if="llmApplyStuck"',
+		].map(at);
+		expect([...order].sort((a, b) => a - b)).toEqual(order);
+	});
+
+	it("puts the expired banner directly after the billing banner, before the soft worker comment", () => {
+		const start = at('v-else-if="subscriptionExpired"');
+		const comment = at("<!-- Soft worker warning");
+		const worker = at('v-else-if="workersWarnNotice"');
+		expect(comment).toBeGreaterThan(start);
+		expect(comment).toBeLessThan(worker);
+		const billing = at('v-else-if="suspendedNotice"');
+		const between = chatSrc.slice(billing + 'v-else-if="'.length, start);
+		expect(between).not.toContain('v-else-if="');
+	});
+
+	it("shows the Reconnect action on the banner only when the banner says so", () => {
+		const start = at('v-else-if="subscriptionExpired"');
+		const end = at('v-else-if="workersWarnNotice"');
+		const block = chatSrc.slice(start, end);
+		expect(block).toContain('v-if="subscriptionExpired.showReconnect"');
+		expect(block).toContain("goReconnectSubscription(subscriptionExpired.upstream)");
+	});
+
+	it("renders a Reconnect button on the failed-message card for admins only", () => {
+		const i = at("errorInfo(m).action === 'reconnect'");
+		const open = chatSrc.lastIndexOf("<button", i);
+		const close = chatSrc.indexOf("</button>", i);
+		expect(open).not.toBe(-1);
+		expect(close).toBeGreaterThan(i);
+		const button = chatSrc.slice(open, close);
+		expect(button).toContain("canConnectModel");
+		expect(button).toContain("errorInfo(m).actionLabel");
+		expect(button).toContain("goReconnectSubscription(errorInfo(m).upstream)");
+	});
+
+	it("shares one CSS class between Retry and Reconnect instead of copying inline styles", () => {
+		const i = at("errorInfo(m).action === 'reconnect'");
+		const button = chatSrc.slice(
+			chatSrc.lastIndexOf("<button", i),
+			chatSrc.indexOf("</button>", i)
+		);
+		expect(button).toContain('class="jv-retry"');
+		expect(button).not.toContain(":style");
+		expect(button).not.toContain("var(--red)");
+	});
+
+	it("tells the error classifier whether the viewer is an admin and which upstreams exist", () => {
+		const i = at("...turnErrorInfo(m.error, meta.code,");
+		const block = chatSrc.slice(i, i + 300);
+		expect(block).toContain("admin: canConnectModel");
+		expect(block).toContain("subscriptionUpstreams");
+	});
+
+	it("passes the expired-model map and the message model to the classifier, and keys the cache on them", () => {
+		const i = at("...turnErrorInfo(m.error, meta.code,");
+		const block = chatSrc.slice(i, i + 400);
+		expect(block).toContain("model: m.model");
+		expect(block).toContain("expiredModels");
+		expect(chatSrc).toContain("expiredModelMap(subscriptionNotice.expiredModels)");
+		const key = chatSrc.slice(chatSrc.indexOf("const key = `${m.name}"), i);
+		expect(key).toContain("m.model");
+		expect(key).toContain("expiredModels");
+	});
+
+	it("passes :expired-models to the model picker", () => {
+		expect(chatSrc).toContain(':expired-models="expiredModels"');
+	});
+
+	it("loads the notice on mount and listens for the realtime refresh", () => {
+		expect(chatSrc).toContain("loadSubscriptionNotice();");
+		expect(chatSrc).toContain("watchSubscriptionNotice(socket)");
+		expect(chatSrc).toContain("unwatchSubscriptionNotice()");
+	});
+});
+
+describe("network_check_required (private network)", () => {
+	it("hands admin's sentence to the generic not-ready banner and is not a setup-poster reason", async () => {
+		const sentence =
+			"Allow your Jarvis server through your firewall, then test the connection.";
+		verdict({ ready: false, reason: "network_check_required", detail: sentence });
+		expect(await readinessDetailOf()).toBe(sentence);
+		expect(await needsOnboarding()).toBe(false);
+	});
+
+	it("needsNetworkCheck is true for this reason alone", async () => {
+		verdict({ ready: false, reason: "network_check_required", detail: "x" });
+		expect(await needsNetworkCheck()).toBe(true);
+		forgetReady();
+		verdict({ ready: false, reason: "container_provisioning", detail: "x" });
+		expect(await needsNetworkCheck()).toBe(false);
+		forgetReady();
+		verdict({ ready: true });
+		expect(await needsNetworkCheck()).toBe(false);
+	});
+
+	it("the Connect-panel link round-trips through hasNetworkIntent", () => {
+		expect(NETWORK_INTENT_URL).toBe("/jarvis/onboarding?network=1");
+		expect(hasNetworkIntent("?network=1")).toBe(true);
+		expect(hasNetworkIntent("?reconnect=1")).toBe(false);
+		expect(hasNetworkIntent("")).toBe(false);
+	});
+
+	it("ChatView gives the customer a route to the Connect panel, ahead of the generic banner", () => {
+		const HERE = path.dirname(fileURLToPath(import.meta.url));
+		const src = fs.readFileSync(path.join(HERE, "..", "views", "ChatView.vue"), "utf8");
+		const specific = src.indexOf('v-else-if="networkCheckRequired"');
+		const generic = src.indexOf('v-else-if="notReadyNotice"');
+		expect(specific, "ChatView must render the network_check_required banner").not.toBe(-1);
+		expect(specific).toBeLessThan(generic);
+		expect(src).toContain('@click="goNetworkCheck"');
+	});
+});
