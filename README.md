@@ -11,6 +11,8 @@
   <img src="https://img.shields.io/badge/Node.js-22%2B-43853D.svg" alt="Node.js 22 or newer" />
 </p>
 
+<p align="center"><a href="https://github.com/channallikrishnasai/ArthiX">View the source on GitHub</a></p>
+
 ArthiX brings customer relationships, finance, team work, and day-to-day operations into one connected application. Run it on infrastructure you control, explore it with the included StrideWorks Footwear demo, and configure the modules and integrations your team needs.
 
 ## Product introduction
@@ -44,6 +46,8 @@ The application includes a browser-based admin workspace, API, marketing site, p
 The StrideWorks Footwear seed dataset provides illustrative retail records to explore the workspace. Start the database services, apply migrations, then load the sample data:
 
 ```bash
+git clone https://github.com/channallikrishnasai/ArthiX.git
+cd ArthiX
 cp .env.example .env
 docker compose up -d postgres redis
 pnpm install
