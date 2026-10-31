@@ -77,7 +77,11 @@ const routes = [
 		// PART 4 REVISED TASK 49(c): a Jarvis Admin (not necessarily SM) may onboard.
 		beforeEnter: (to, from, next) => {
 			next(
-				window.is_system_manager || window.is_jarvis_admin ? undefined : { name: "Chat" }
+				(import.meta.env.DEV && (to.query.paymentDemo === "1" || to.query.judgeDemo === "1")) ||
+					window.is_system_manager ||
+					window.is_jarvis_admin
+					? undefined
+					: { name: "Chat" }
 			);
 		},
 	},
@@ -261,6 +265,11 @@ const router = createRouter({
 let _pendingTarget = null;
 router.beforeEach(async (to) => {
 	_pendingTarget = to && to.fullPath;
+	if (
+		to.name === "Onboarding" &&
+		(to.query.paymentDemo === "1" || to.query.judgeDemo === "1") &&
+		import.meta.env.DEV
+	) return true;
 	const ready = await isWorkspaceReady();
 	if (ready && to.name === "Onboarding") {
 		return { name: "Chat" };

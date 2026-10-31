@@ -3,10 +3,10 @@
 // changes in place when the Branding pane saves (applyBranding), so a new brand
 // shows at once, with no reload (admin-v2#622). Read it from `brand` where it is
 // used; a copy made at setup or module load goes stale. Blank values fall back to
-// the Jarvis defaults.
+// the ArthiX Jarvis defaults.
 import { reactive } from "vue";
 
-const DEFAULT_NAME = "Jarvis";
+const DEFAULT_NAME = "ArthiX Jarvis";
 
 export const brand = reactive({
 	name: (window.agent_name || "").trim(),
@@ -16,7 +16,7 @@ export const brand = reactive({
 		return this.name || DEFAULT_NAME;
 	},
 	// True once the customer has set any custom identity (name or logo). Lets copy
-	// decide between "Jarvis" defaults and the tenant brand.
+	// decide between the product default and the tenant brand.
 	get isWhitelabeled() {
 		return this.agentName !== DEFAULT_NAME || !!this.logoUrl;
 	},
@@ -51,8 +51,7 @@ export function applyBrandChrome() {
 				})),
 			};
 		}
-		document.title =
-			brand.agentName !== DEFAULT_NAME ? `${brand.agentName} Chat` : defaultChrome.title;
+		document.title = `${brand.agentName} Chat`;
 		if (!defaultChrome.links.length) {
 			// No icon link in the shell: add one for the brand favicon.
 			let added = document.querySelector("link[data-jv-brand-icon]");

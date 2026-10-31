@@ -1,6 +1,6 @@
 <div align="center">
   <img src="docs/assets/jarvis-workflow-hero.png" alt="A luminous 3D workflow of documents, approvals, dashboards, and connected business tools" width="100%" />
-  <h1>Jarvis</h1>
+  <h1>ArthiX Jarvis</h1>
   <p><strong>The AI teammate inside ERPNext.</strong></p>
   <p>Ask. Verify. Approve. Repeat.</p>
 </div>
@@ -9,7 +9,7 @@
   <img src="docs/assets/automation-flow.svg" alt="Animated workflow: source documents become evidence, a person reviews proposed work, approved actions reach ERPNext, and good work becomes reusable" width="100%" />
 </p>
 
-Your ERP already knows what happened. Jarvis helps your team ask what it means,
+Your ERP already knows what happened. ArthiX Jarvis helps your team ask what it means,
 prepare what should happen next, and repeat good work without losing human
 judgement.
 
@@ -22,14 +22,14 @@ judgement.
 <p align="center">
   <a href="#features">Features</a> ·
   <a href="#how-to-install">Install</a> ·
-  <a href="#what-makes-jarvis-different">Safety model</a>
+  <a href="#what-makes-arthix-jarvis-different">Safety model</a>
 </p>
 
 ## A clear path from question to action
 
 ```mermaid
 flowchart LR
-    Person[Your team] --> Chat[Jarvis workspace]
+    Person[Your team] --> Chat[ArthiX Jarvis workspace]
     Chat --> Context[Permission-checked ERP context]
     Context --> Records[(ERPNext records)]
     Chat --> Proposal[Prepared work with evidence]
@@ -39,13 +39,13 @@ flowchart LR
     Playbook[Skills · macros · triggers · agents] --> Proposal
 ```
 
-## What makes Jarvis different
+## What makes ArthiX Jarvis different
 
-Jarvis is not a chat window pointed at your database. Three things hold, always:
+ArthiX Jarvis is not a chat window pointed at your database. Three things hold, always:
 
 - **It acts as you.** Every question and every action runs under your own Frappe
-  and ERPNext permissions. Jarvis can never see or touch a record you could not
-  open yourself.
+  and ERPNext permissions. ArthiX Jarvis can never see or touch a record you
+  could not open yourself.
 - **Nothing important happens without you.** Reading and explaining happen
   directly. Anything that writes, submits, or is hard to reverse waits for a
   person to review and approve it, with the evidence in view.
@@ -71,7 +71,7 @@ Jarvis is not a chat window pointed at your database. Three things hold, always:
 
 - Drop supplier bills, statements, price lists, and other source files into
   **File Box**.
-- Let Jarvis read the source, prepare the corresponding work, and surface any
+- Let ArthiX Jarvis read the source, prepare the corresponding work, and surface any
   uncertainty instead of quietly guessing.
 - Use the **Approval Board** to inspect drafts, answer questions, approve the
   next step, or reject it with the source conversation still in reach.
@@ -83,9 +83,9 @@ Jarvis is not a chat window pointed at your database. Three things hold, always:
 
 - Add **Business Notes** for the terms, exceptions, and operating facts that
   make your company different.
-- Use the **Wiki** to see what Jarvis knows, where it came from, who it applies
+- Use the **Wiki** to see what ArthiX Jarvis knows, where it came from, who it applies
   to, and whether it needs correction.
-- Save a business rule as a **Skill** so Jarvis follows it consistently next
+- Save a business rule as a **Skill** so ArthiX Jarvis follows it consistently next
   time.
 - Save several steps as a **Macro**, run them again, or put them on a daily,
   weekly, or monthly schedule.
@@ -117,15 +117,15 @@ Jarvis is not a chat window pointed at your database. Three things hold, always:
 
 ## How to Install
 
-Jarvis supports Frappe 15 and 16.
+ArthiX Jarvis supports Frappe 15 and 16. The Frappe app slug remains `jarvis`
+so existing routes and integrations continue to work.
 
 ### Self-hosted bench
 
 Run these commands from your Frappe bench:
 
 ```bash
-# On a Frappe 15 site, use --branch version-15 instead
-bench get-app https://github.com/aerele/jarvis.git --branch version-16
+bench get-app https://github.com/channallikrishnasai/ArthiX.git --branch main
 bench --site your-site.example install-app jarvis
 ```
 
@@ -134,23 +134,29 @@ bench --site your-site.example install-app jarvis
 On a private bench group:
 
 1. Open **Bench Group > Apps**, choose **Add App**, and add
-   `https://github.com/aerele/jarvis.git` from the `version-16` branch
-   (`version-15` for a Frappe 15 site).
+   `https://github.com/channallikrishnasai/ArthiX.git` from the `main` branch.
 2. Deploy the bench update to your site.
-3. Open **Site > Apps**, choose **Install App**, and install **Jarvis**.
+3. Open **Site > Apps**, choose **Install App**, and install **ArthiX Jarvis** (app slug `jarvis`).
 
 After installation, sign in as a System Manager, open `/jarvis/onboarding`, and
 follow the setup shown on screen.
 
-### Local payment walkthrough
+### Local judge preview
 
-For a UI presentation, start the frontend in development mode and open
-`/jarvis/onboarding?paymentDemo=1`. Choose a plan, then select **Razorpay local demo**
-or **Paytm demo** and click **Start free trial**. The page shows a simulated success
-without sending identity or billing data, creating a subscription, authorizing a
-mandate, or contacting a payment provider. The mode is disabled in production builds.
-It does not create a Razorpay dashboard event; real Razorpay Test Mode needs test
-credentials on the billing control plane and a publicly reachable onboarding host.
+From the project root, run `npm run dev-frontend`, then open
+`http://localhost:8080/jarvis/onboarding?judgeDemo=1`. Complete the local setup
+screens and select **Open ArthiX Jarvis Pro** at the checkout step. In development,
+that button skips billing and opens the original workspace under your signed-in
+Frappe account. It does not create or imply a paid subscription. The mode is
+disabled in production builds, and the workspace's normal session and ERP
+permissions still apply. Live AI chat also requires a model already connected to
+the workspace.
+
+For a judge walkthrough, open **Business chat**, ask about a real order or invoice
+from the connected ERP, inspect the records and evidence behind the response, then
+show **Approvals**, **File Box**, and **Dashboards**. Use the account's normal
+appearance control to switch to light mode. The preview never inserts fictional
+business records or canned assistant answers.
 
 ### Updating PDF chart support
 

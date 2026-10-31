@@ -1,5 +1,5 @@
 app_name = "jarvis"
-app_title = "Jarvis"
+app_title = "ArthiX Jarvis"
 app_publisher = "Aerele Technologies Pvt Ltd"
 app_description = "The AI teammate inside ERPNext"
 app_email = "jarvis@aerele.in"

@@ -568,8 +568,9 @@
 										<div class="text-base font-medium text-ink-gray-9">
 											{{ p.plan_name }}
 										</div>
-										<div
-											class="mb-0.5 mt-2.5 text-[22px] font-medium text-ink-gray-9"
+						<div
+							v-if="!localPaymentDemo"
+							class="mb-0.5 mt-2.5 text-[22px] font-medium text-ink-gray-9"
 										>
 											{{ planAmount(p.price_inr)
 											}}<span
@@ -588,7 +589,7 @@
 										     gst_percent at all, must not claim "excl. GST" they don't owe.
 										     The due-today line right below IS tax-inclusive (it's a real
 										     charge amount) - only the base rate needs the caveat. -->
-										<div class="text-xs text-ink-gray-5">
+						<div v-if="!localPaymentDemo" class="text-xs text-ink-gray-5">
 											{{ planCycleLabel(p)
 											}}<template v-if="planHasGst(p)">
 												· excl. GST</template
@@ -598,12 +599,15 @@
 										     used to meet this only on Review, a screen after
 										     choosing, so nothing told them the trial starts at
 										     zero while they were deciding. -->
-										<div
-											v-if="planDueToday(p)"
+						<div
+							v-if="!localPaymentDemo && planDueToday(p)"
 											class="mt-2 text-p-sm font-medium text-ink-gray-8"
 										>
-											{{ planDueToday(p) }}
-										</div>
+							{{ planDueToday(p) }}
+						</div>
+						<p v-if="localPaymentDemo" class="mt-2 text-p-sm text-ink-gray-5">
+							Local judge preview · no subscription or payment is created.
+						</p>
 										<!-- #671: not rendered at all when a plan has no features. The
 										     old fallback bullet said "Monthly plan", repeating both the
 										     "/mo" on the price and the cycle line directly above it.
@@ -650,7 +654,7 @@
 								<div class="ob-head">
 									<h1>{{ localPaymentDemo ? "Demo details" : "Your details" }}</h1>
 									<p v-if="localPaymentDemo">
-										These fields are for display only. The local demo will not submit or save them.
+						These fields are for display only. The local judge preview will not submit or save them.
 									</p>
 									<p v-else>
 										We'll set {{ brand.agentName }} up for this workspace and send receipts here.
@@ -1284,20 +1288,22 @@
 							 an HTTP status or an error message. ===== -->
 						<section v-else-if="state.step === 'pay'" class="ob-screen">
 							<div
-								v-if="localPaymentDemo && state.demoPaymentSuccess"
+							v-if="localPaymentDemo"
 								class="ob-body"
-								role="status"
 							>
 								<div class="ob-head">
-									<h1>Free trial started · demo</h1>
-									<p>Local checkout simulation completed using {{ providerLabel(state.demoPaymentSuccess) }}.</p>
+								<h1>Continue to ArthiX Jarvis Pro</h1>
+								<p>This development-only judge shortcut opens the original Jarvis workspace and skips checkout.</p>
 									<p class="mt-2 text-p-sm text-ink-gray-5">
-										This is a local-only preview. No card or bank details were collected, no payment or mandate was created, and no transaction appears in a Razorpay or Paytm dashboard.
+									It does not activate a subscription or change billing. The workspace uses your signed-in account and existing ERP permissions; live chat still requires a connected AI model.
 									</p>
 								</div>
 								<div class="mt-6 flex justify-center gap-3">
-									<Button variant="subtle" label="Run demo again" @click="state.demoPaymentSuccess = ''" />
-									<Button variant="solid" label="Open workspace" @click="router.push({ name: 'Chat' })" />
+									<Button
+										variant="solid"
+									label="Open ArthiX Jarvis Pro"
+									@click="onPayClick"
+									/>
 								</div>
 							</div>
 							<!-- Paid: the payment step is over. Receipt + workspace-setup
@@ -2921,7 +2927,11 @@ const { effectiveDark: dark, paletteVars } = useJarvisTheme();
 // builds and must be explicitly enabled with ?paymentDemo=1. It never invokes
 // the billing control plane or a payment gateway.
 const localPaymentDemo =
-	import.meta.env.DEV && new URLSearchParams(window.location.search).get("paymentDemo") === "1";
+	import.meta.env.DEV &&
+	(() => {
+		const params = new URLSearchParams(window.location.search);
+		return params.get("judgeDemo") === "1" || params.get("paymentDemo") === "1";
+	})();
 
 // Server-authoritative: onboarding is blocked when the bench is on a
 // local/non-public host (magic links + agent callbacks can't reach it).
@@ -3567,6 +3577,7 @@ async function loadPaymentProviders() {
 // payment"; an autopay trial keeps its trial wording (C02-4), since that click
 // authorizes the auto-pay mandate rather than charging today.
 const payCta = computed(() => {
+	if (localPaymentDemo) return "Open ArthiX Jarvis Pro";
 	// Private network: this first click only starts the signup and the email step; payment
 	// comes after the connection test, so "Continue" (as in the mockup) is the honest label.
 	if (privateComplete.value) return "Continue";
@@ -3790,7 +3801,16 @@ async function loadPlans() {
 	state.plansErr = "";
 	state.plansLoading = true;
 	try {
-		state.plans = (await listPlans()) || [];
+		state.plans = localPaymentDemo
+			? [
+					{
+					name: "pro-preview",
+					plan_name: "ArthiX Jarvis Pro",
+						features:
+							"Unlimited ERPNext and Frappe users\nUp to 8 concurrent active users\nChat, File Box, Approval Board, and Dashboards\nAgents, Skills, Macros, Triggers, Wiki, and learning\nAgent runtime capacity up to 6 GB RAM\nMultiple supported chat subscriptions\nTicket and on-call support for critical issues",
+					},
+				]
+			: (await listPlans()) || [];
 		// #671: a single-choice question must not need a click to answer it. With
 		// exactly one plan on offer the card started unselected and Continue was
 		// disabled until you clicked the only thing on screen, which is a dead click.
@@ -5289,10 +5309,9 @@ async function onPayClick() {
 	// off; guard the handler too so a stray/programmatic click cannot start a signup.
 	if (!state.paymentUiV2) return;
 	if (localPaymentDemo) {
-		// Deliberately do not enter the payment state machine: only the control plane
-		// may attest a real checkout. This result exists solely in local UI memory.
-		if (!state.paymentProvider || !["razorpay", "paytm"].includes(state.paymentProvider)) return;
-		state.demoPaymentSuccess = state.paymentProvider;
+		// Local judge mode enters the original workspace without creating or implying
+		// a paid subscription. Server APIs retain their normal session and permission gates.
+		router.push({ name: "Chat", query: { judgeDemo: "1" } });
 		return;
 	}
 	// Plan 01: the normalized billing snapshot rides this first signup call so it
@@ -6827,6 +6846,13 @@ function onCheckoutVisibility() {
 }
 
 onMounted(async () => {
+	if (localPaymentDemo) {
+		// Start a clean, data-free walkthrough. Do not hydrate payment state,
+		// prefill account details, write a lead, or call any checkout endpoint.
+		state.step = "intro";
+		loadPaymentProviders();
+		return;
+	}
 	// Private network: learn reachability (Network step) or the saved address (a reload after
 	// the setup). Not awaited and never reached on a public bench.
 	if (privateBench.value) net.loadStatus();

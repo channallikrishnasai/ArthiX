@@ -14,7 +14,7 @@ beforeEach(() => {
 	document.head.innerHTML =
 		'<link rel="icon" href="/assets/jarvis/icon.png" sizes="32x32" type="image/png">' +
 		'<link rel="apple-touch-icon" href="/assets/jarvis/apple.png">';
-	document.title = "Jarvis";
+	document.title = "ArthiX Jarvis Chat";
 });
 afterEach(() => {
 	delete window.agent_name;
@@ -28,9 +28,9 @@ const iconHrefs = () =>
 	);
 
 describe("brand", () => {
-	it("starts from the boot values, with the Jarvis defaults for blanks", async () => {
+	it("starts from the boot values, with the ArthiX Jarvis defaults for blanks", async () => {
 		const { brand } = await load();
-		expect(brand.agentName).toBe("Jarvis");
+		expect(brand.agentName).toBe("ArthiX Jarvis");
 		expect(brand.logoUrl).toBe("");
 		expect(brand.isWhitelabeled).toBe(false);
 
@@ -43,7 +43,7 @@ describe("brand", () => {
 	it("applyBranding changes it in place, so readers update without a reload", async () => {
 		const { brand, applyBranding } = await load();
 		const label = computed(() => `Ask ${brand.agentName}`);
-		expect(label.value).toBe("Ask Jarvis");
+		expect(label.value).toBe("Ask ArthiX Jarvis");
 		applyBranding({
 			agent_name: "Acme",
 			brand_logo_url: "/files/b.png",
@@ -53,14 +53,14 @@ describe("brand", () => {
 		expect(brand.logoUrl).toBe("/files/b.png");
 		expect(brand.isWhitelabeled).toBe(true);
 		applyBranding({ agent_name: "", brand_logo_url: "", brand_favicon_url: "" });
-		expect(label.value).toBe("Ask Jarvis");
+		expect(label.value).toBe("Ask ArthiX Jarvis");
 		expect(brand.isWhitelabeled).toBe(false);
 	});
 
 	it("the tab title and favicon follow the brand, and come back when it is removed", async () => {
 		const { applyBrandChrome, applyBranding } = await load();
 		applyBrandChrome();
-		expect(document.title).toBe("Jarvis");
+		expect(document.title).toBe("ArthiX Jarvis Chat");
 		expect(iconHrefs()).toEqual(["/assets/jarvis/icon.png", "/assets/jarvis/apple.png"]);
 
 		applyBranding({
@@ -72,7 +72,7 @@ describe("brand", () => {
 		expect(iconHrefs()).toEqual(["/files/fav.ico", "/files/fav.ico"]);
 
 		applyBranding({ agent_name: "", brand_logo_url: "", brand_favicon_url: "" });
-		expect(document.title).toBe("Jarvis");
+		expect(document.title).toBe("ArthiX Jarvis Chat");
 		expect(iconHrefs()).toEqual(["/assets/jarvis/icon.png", "/assets/jarvis/apple.png"]);
 		const icon = document.querySelector('link[rel="icon"]');
 		expect([icon.getAttribute("sizes"), icon.getAttribute("type")]).toEqual([

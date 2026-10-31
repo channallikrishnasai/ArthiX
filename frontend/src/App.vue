@@ -3,6 +3,7 @@
 </template>
 
 <script setup>
-// §14 DA-07: App.vue = <AppShell/> only; AppShell owns the single <router-view/>.
+// AppShell owns the regular workspace view; the dev-only demo route runs
+// standalone so first-run gates and account APIs cannot block the preview.
 import AppShell from "@/components/shell/AppShell.vue";
 </script>

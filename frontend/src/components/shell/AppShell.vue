@@ -162,8 +162,14 @@ const regatingOnboarding = ref(false);
 const shellReady = computed(
 	() => gatedOnboarding.value !== null && !!route.name && !regatingOnboarding.value
 );
-// The wizard route is exempt so the poster's button can navigate into it.
-const showGate = computed(() => gatedOnboarding.value === true && route.name !== "Onboarding");
+// The setup wizard and explicit development judge entry remain usable before
+// production workspace readiness is complete.
+const showGate = computed(
+	() =>
+		gatedOnboarding.value === true &&
+		route.name !== "Onboarding" &&
+		!(import.meta.env.DEV && route.name === "Chat" && route.query.judgeDemo === "1")
+);
 
 // #691: the boot-time read above runs exactly ONCE for the whole SPA session -
 // AppShell never remounts on a client-side navigation (App.vue is just

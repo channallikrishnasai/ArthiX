@@ -113,7 +113,7 @@ function _start() {
 	applyTheme();
 }
 
-function setTheme(t) {
+function setTheme(t, { persist = true } = {}) {
 	theme.value = t;
 	applyTheme();
 	// Anti-FOUC cache: frontend/index.html reads this synchronously, before Vue
@@ -126,9 +126,11 @@ function setTheme(t) {
 	}
 	// Persist to Frappe's native per-user desk_theme (fire-and-forget; the
 	// in-memory value already drives the UI, so a failed write just isn't saved).
-	import("@/api")
-		.then(({ setUserTheme }) => setUserTheme(t))
-		.catch(() => {});
+	if (persist) {
+		import("@/api")
+			.then(({ setUserTheme }) => setUserTheme(t))
+			.catch(() => {});
+	}
 }
 // The toggle is a strict two-state flip of the EFFECTIVE appearance. It used
 // to cycle light → dark → system, but with a dark OS the dark → system step
